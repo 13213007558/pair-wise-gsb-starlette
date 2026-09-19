@@ -7,7 +7,7 @@ import re
 import traceback
 import types
 import warnings
-from collections.abc import Awaitable, Collection, Generator, Sequence
+from collections.abc import Awaitable, Collection, Generator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager
 from enum import Enum
 from re import Pattern
@@ -577,6 +577,90 @@ class _DefaultLifespan:
         return self
 
 
+MOUNTED_LIFESPAN_STATES = "starlette.mounted_lifespan_states"
+
+
+def _collect_composed_lifespan_apps(root: Any) -> list[Any]:
+    apps: list[Any] = []
+    collected_apps: set[int] = set()
+    active: set[int] = set()
+
+    def visit(app: Any) -> None:
+        app_id = id(app)
+        if app_id in active:
+            raise RuntimeError("Cannot compose lifespans for a cyclic mount graph.")
+
+        active.add(app_id)
+        try:
+            router = getattr(app, "router", None)
+            routes = router.routes if router is not None else app.routes
+            for route in routes:
+                if not isinstance(route, Mount):
+                    continue
+
+                mounted_app = route._base_app
+                mounted_app_id = id(mounted_app)
+                if mounted_app_id in active:
+                    raise RuntimeError("Cannot compose lifespans for a cyclic mount graph.")
+
+                mounted_router = getattr(mounted_app, "router", None)
+                if (
+                    mounted_router is not None
+                    and hasattr(mounted_router, "lifespan_context")
+                    and mounted_app_id not in collected_apps
+                ):
+                    apps.append(mounted_app)
+                    collected_apps.add(mounted_app_id)
+                visit(mounted_app)
+        finally:
+            active.remove(app_id)
+
+    visit(root)
+    return apps
+
+
+class _ComposedLifespan(AbstractAsyncContextManager[Mapping[str, Any] | None]):
+    def __init__(self, app: Any, lifespan_context: Lifespan[Any]) -> None:
+        self._app = app
+        self._lifespan_context = lifespan_context
+        self._states: dict[Any, Mapping[str, Any]] = {}
+
+    def __call__(self, app: Any) -> AbstractAsyncContextManager[Mapping[str, Any] | None]:
+        return self
+
+    async def __aenter__(self) -> Mapping[str, Any] | None:
+        self._apps = _collect_composed_lifespan_apps(self._app)
+        self._states = {}
+        self._app.router.mounted_lifespan_states = self._states
+
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                root_state = await stack.enter_async_context(self._lifespan_context(self._app))
+                for app in self._apps:
+                    lifespan_context = app.router.lifespan_context
+                    if isinstance(lifespan_context, _ComposedLifespan):
+                        lifespan_context = lifespan_context._lifespan_context
+                    state = await stack.enter_async_context(lifespan_context(app))
+                    if state is not None:
+                        self._states[app] = state
+                self._stack = stack.pop_all()
+        except BaseException:
+            self._app.router.mounted_lifespan_states = {}
+            raise
+        return root_state
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: types.TracebackType | None,
+    ) -> None:
+        try:
+            await self._stack.__aexit__(exc_type, exc_value, traceback)
+        finally:
+            self._app.router.mounted_lifespan_states = {}
+
+
 class Router:
     def __init__(
         self,
@@ -633,6 +717,7 @@ class Router:
             )
         else:
             self.lifespan_context = lifespan
+        self.mounted_lifespan_states: dict[Any, Mapping[str, Any]] = {}
 
         self.middleware_stack = self.app
         if middleware:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import warnings
 from collections.abc import Awaitable, Mapping, Sequence
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, TypeVar, cast
 
 if sys.version_info >= (3, 10):  # pragma: no cover
     from typing import ParamSpec
@@ -17,7 +17,7 @@ from starlette.middleware.errors import ServerErrorMiddleware
 from starlette.middleware.exceptions import ExceptionMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.routing import BaseRoute, Router
+from starlette.routing import MOUNTED_LIFESPAN_STATES, BaseRoute, Router, _ComposedLifespan
 from starlette.types import ASGIApp, ExceptionHandler, Lifespan, Receive, Scope, Send
 from starlette.websockets import WebSocket
 
@@ -37,6 +37,7 @@ class Starlette:
         on_startup: Sequence[Callable[[], Any]] | None = None,
         on_shutdown: Sequence[Callable[[], Any]] | None = None,
         lifespan: Lifespan[AppType] | None = None,
+        compose_mounted_lifespans: bool = False,
     ) -> None:
         """Initializes the application.
 
@@ -63,6 +64,8 @@ class Starlette:
             lifespan: A lifespan context function, which can be used to perform
                 startup and shutdown tasks. This is a newer style that replaces the
                 `on_startup` and `on_shutdown` handlers. Use one or the other, not both.
+            compose_mounted_lifespans: When enabled, this application starts and
+                shuts down mounted Starlette applications in its mount tree.
         """
         # The lifespan context function is a newer style that replaces
         # on_startup / on_shutdown handlers. Use one or the other, not both.
@@ -73,6 +76,11 @@ class Starlette:
         self.debug = debug
         self.state = State()
         self.router = Router(routes, on_startup=on_startup, on_shutdown=on_shutdown, lifespan=lifespan)
+        if compose_mounted_lifespans:
+            self.router.lifespan_context = cast(
+                Lifespan[AppType],
+                _ComposedLifespan(self, self.router.lifespan_context),
+            )
         self.exception_handlers = {} if exception_handlers is None else dict(exception_handlers)
         self.user_middleware = [] if middleware is None else list(middleware)
         self.middleware_stack: ASGIApp | None = None
@@ -107,10 +115,36 @@ class Starlette:
         return self.router.url_path_for(name, **path_params)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        previous_app = scope.get("app")
         scope["app"] = self
         if self.middleware_stack is None:
             self.middleware_stack = self.build_middleware_stack()
-        await self.middleware_stack(scope, receive, send)
+        state_map = scope.get(MOUNTED_LIFESPAN_STATES)
+        mounted_states = self.router.mounted_lifespan_states
+        state_map_installed = False
+        if state_map is None and mounted_states and scope["type"] in ("http", "websocket"):
+            state_map = mounted_states
+            scope[MOUNTED_LIFESPAN_STATES] = state_map
+            state_map_installed = True
+        restore_app = state_map is not None and previous_app is not None
+        previous_state = scope.get("state")
+        state_installed = False
+        if state_map is not None and self in state_map:
+            parent_state = scope.get("state", {})
+            scope["state"] = {**dict(parent_state), **dict(state_map[self])}
+            state_installed = True
+        try:
+            await self.middleware_stack(scope, receive, send)
+        finally:
+            if restore_app and previous_app is not None:
+                scope["app"] = previous_app
+            if state_installed:
+                if previous_state is None:
+                    del scope["state"]
+                else:
+                    scope["state"] = previous_state
+            if state_map_installed:
+                del scope[MOUNTED_LIFESPAN_STATES]
 
     def on_event(self, event_type: str) -> Callable:  # type: ignore[type-arg]
         return self.router.on_event(event_type)  # pragma: no cover

@@ -593,3 +593,423 @@ def test_lifespan_app_subclass() -> None:
         yield
 
     App(lifespan=lifespan)
+
+
+def test_composed_mounted_lifespans_startup_order(
+    test_client_factory: TestClientFactory,
+) -> None:
+    events: list[str] = []
+
+    def lifespan(name: str) -> Callable[[ASGIApp], AsyncIterator[dict[str, str]]]:
+        @asynccontextmanager
+        async def managed_app(app: ASGIApp) -> AsyncIterator[dict[str, str]]:
+            events.append(f"start:{name}")
+            try:
+                yield {}
+            finally:
+                events.append(f"stop:{name}")
+
+        return managed_app
+
+    shared = Starlette(lifespan=lifespan("shared"))
+    other = Starlette(lifespan=lifespan("other"))
+    parent = Starlette(
+        lifespan=lifespan("parent"),
+        routes=[
+            Mount("/shared", app=shared),
+            Mount("/shared-again", app=shared),
+        ],
+    )
+    nested = Router(routes=[Mount("/other", app=other)])
+    root = Starlette(
+        compose_mounted_lifespans=True,
+        lifespan=lifespan("root"),
+        routes=[
+            Mount("/parent", app=parent),
+            Mount("/nested", app=nested),
+        ],
+    )
+
+    with test_client_factory(root):
+        assert events == ["start:root", "start:parent", "start:shared", "start:other"]
+
+    assert events == [
+        "start:root",
+        "start:parent",
+        "start:shared",
+        "start:other",
+        "stop:other",
+        "stop:shared",
+        "stop:parent",
+        "stop:root",
+    ]
+
+
+def test_mounted_lifespans_are_not_composed_by_default(
+    test_client_factory: TestClientFactory,
+) -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def child_lifespan(app: ASGIApp) -> AsyncIterator[None]:
+        events.append("start")
+        try:
+            yield
+        finally:
+            events.append("stop")
+
+    child = Starlette(lifespan=child_lifespan)
+    root = Starlette(routes=[Mount("/child", app=child)])
+
+    with test_client_factory(root):
+        assert events == []
+    assert events == []
+
+
+def test_composed_mounted_lifespans_support_async_context_managers(
+    test_client_factory: TestClientFactory,
+) -> None:
+    events: list[str] = []
+
+    class Lifespan:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def __aenter__(self) -> None:
+            events.append("start:" + self.name)
+
+        async def __aexit__(self, *args: object) -> None:
+            events.append("stop:" + self.name)
+
+        def __call__(self, app: ASGIApp) -> Lifespan:
+            return self
+
+    child = Starlette(lifespan=Lifespan("child"))
+    root = Starlette(
+        compose_mounted_lifespans=True,
+        lifespan=Lifespan("root"),
+        routes=[Mount("/child", app=child)],
+    )
+
+    with test_client_factory(root):
+        assert events == ["start:root", "start:child"]
+    assert events == ["start:root", "start:child", "stop:child", "stop:root"]
+
+
+def test_composed_mounted_lifespans_unwrap_nested_composition(
+    test_client_factory: TestClientFactory,
+) -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def lifespan(name: str, app: ASGIApp) -> AsyncIterator[None]:
+        events.append("start:" + name)
+        try:
+            yield
+        finally:
+            events.append("stop:" + name)
+
+    grandchild = Starlette(lifespan=lambda app: lifespan("grandchild", app))
+    child = Starlette(
+        compose_mounted_lifespans=True,
+        lifespan=lambda app: lifespan("child", app),
+        routes=[Mount("/grandchild", app=grandchild)],
+    )
+    root = Starlette(
+        compose_mounted_lifespans=True,
+        lifespan=lambda app: lifespan("root", app),
+        routes=[Mount("/child", app=child)],
+    )
+
+    with test_client_factory(root):
+        assert events == ["start:root", "start:child", "start:grandchild"]
+    assert events == [
+        "start:root",
+        "start:child",
+        "start:grandchild",
+        "stop:grandchild",
+        "stop:child",
+        "stop:root",
+    ]
+
+
+def test_composed_mounted_lifespan_state_isolation(
+    test_client_factory: TestClientFactory,
+) -> None:
+    events: list[str] = []
+
+    def lifespan(
+        name: str,
+        state: dict[str, str],
+    ) -> Callable[[ASGIApp], AsyncIterator[dict[str, str]]]:
+        @asynccontextmanager
+        async def managed_app(app: ASGIApp) -> AsyncIterator[dict[str, str]]:
+            events.append(f"start:{name}")
+            try:
+                yield state
+            finally:
+                events.append(f"stop:{name}")
+
+        return managed_app
+
+    async def show_state(request: Request) -> JSONResponse:
+        return JSONResponse(dict(request.scope["state"]))
+
+    async def mutate_state(request: Request) -> JSONResponse:
+        request.state.shared = "mutated"
+        request.state.child_only = "mutated"
+        request.state.request_only = "mutated"
+        return JSONResponse(dict(request.scope["state"]))
+
+    shared_state = {
+        "name": "shared",
+        "shared": "child",
+        "child_only": "shared",
+    }
+    other_state = {
+        "name": "other",
+        "shared": "other",
+        "child_only": "other",
+    }
+    shared = Starlette(
+        lifespan=lifespan("shared", shared_state),
+        routes=[Route("/", endpoint=show_state)],
+    )
+    other = Starlette(
+        lifespan=lifespan("other", other_state),
+        routes=[
+            Route("/", endpoint=show_state),
+            Route("/mutate", endpoint=mutate_state),
+        ],
+    )
+    grandchild = Starlette(
+        lifespan=lifespan("grandchild", {"name": "grandchild", "grandchild_only": "grandchild"}),
+        routes=[Route("/", endpoint=show_state)],
+    )
+    parent = Starlette(
+        lifespan=lifespan("parent", {"parent_only": "parent"}),
+        routes=[
+            Mount("/grand", app=grandchild),
+            Mount("/one", app=shared),
+            Mount("/two", app=shared),
+        ],
+    )
+    root = Starlette(
+        compose_mounted_lifespans=True,
+        lifespan=lifespan(
+            "root",
+            {"shared": "root", "root_only": "root"},
+        ),
+        routes=[
+            Route("/", endpoint=show_state),
+            Mount("/parent", app=parent),
+            Mount("/other", app=other),
+        ],
+    )
+
+    with test_client_factory(root) as client:
+        assert client.get("/").json() == {
+            "shared": "root",
+            "root_only": "root",
+        }
+
+        first = client.get("/parent/one/")
+        expected_shared_state = {
+            "shared": "child",
+            "root_only": "root",
+            "parent_only": "parent",
+            "child_only": "shared",
+            "name": "shared",
+        }
+        assert first.json() == expected_shared_state
+        assert client.get("/parent/two/").json() == expected_shared_state
+
+        assert client.get("/parent/grand/").json() == {
+            "shared": "root",
+            "root_only": "root",
+            "parent_only": "parent",
+            "grandchild_only": "grandchild",
+            "name": "grandchild",
+        }
+
+        assert client.get("/other/").json() == {
+            "shared": "other",
+            "root_only": "root",
+            "child_only": "other",
+            "name": "other",
+        }
+
+        assert client.get("/other/mutate").json() == {
+            "shared": "mutated",
+            "root_only": "root",
+            "child_only": "mutated",
+            "name": "other",
+            "request_only": "mutated",
+        }
+        assert client.get("/").json() == {
+            "shared": "root",
+            "root_only": "root",
+        }
+        assert client.get("/other/").json() == {
+            "shared": "other",
+            "root_only": "root",
+            "child_only": "other",
+            "name": "other",
+        }
+
+    assert events.count("start:shared") == 1
+    assert events.count("stop:shared") == 1
+
+
+def test_composed_mounted_lifespan_startup_failure_rollback(
+    test_client_factory: TestClientFactory,
+) -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def root_lifespan(app: ASGIApp) -> AsyncIterator[None]:
+        events.append("start:root")
+        try:
+            yield
+        finally:
+            events.append("stop:root")
+
+    @asynccontextmanager
+    async def started_lifespan(app: ASGIApp) -> AsyncIterator[None]:
+        events.append("start:started")
+        try:
+            yield
+        finally:
+            events.append("stop:started")
+
+    @asynccontextmanager
+    async def failing_lifespan(app: ASGIApp) -> AsyncIterator[None]:
+        events.append("start:failing")
+        raise RuntimeError("startup failed")
+        yield  # pragma: no cover
+
+    @asynccontextmanager
+    async def later_lifespan(app: ASGIApp) -> AsyncIterator[None]:
+        events.append("start:later")  # pragma: no cover
+        yield  # pragma: no cover
+
+    started = Starlette(lifespan=started_lifespan)
+    failing = Starlette(lifespan=failing_lifespan)
+    later = Starlette(lifespan=later_lifespan)
+    root = Starlette(
+        compose_mounted_lifespans=True,
+        lifespan=root_lifespan,
+        routes=[
+            Mount("/started", app=started),
+            Mount("/failing", app=failing),
+            Mount("/later", app=later),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        with test_client_factory(root):
+            pass  # pragma: no cover
+
+    assert events == [
+        "start:root",
+        "start:started",
+        "start:failing",
+        "stop:started",
+        "stop:root",
+    ]
+
+
+def test_composed_mounted_lifespan_reports_startup_failure(
+    test_client_factory: TestClientFactory,
+) -> None:
+    @asynccontextmanager
+    async def failing_lifespan(app: ASGIApp) -> AsyncIterator[None]:
+        raise RuntimeError("startup failed")
+        yield  # pragma: no cover
+
+    child = Starlette(lifespan=failing_lifespan)
+    root = Starlette(
+        compose_mounted_lifespans=True,
+        routes=[Mount("/child", app=child)],
+    )
+    messages: list[str] = []
+
+    async def reporting_app(scope: Scope, receive: Receive, send: Send) -> None:
+        async def report(message: dict[str, str]) -> None:
+            messages.append(message["type"])
+            await send(message)
+
+        await root(scope, receive, report)
+
+    with pytest.raises(RuntimeError, match="startup failed"):
+        with test_client_factory(reporting_app):
+            pass  # pragma: no cover
+
+    assert messages == ["lifespan.startup.failed"]
+
+
+def test_composed_mounted_lifespan_shutdown_failures_are_combined(
+    test_client_factory: TestClientFactory,
+) -> None:
+    class ShutdownFailure(RuntimeError):
+        def __init__(self, name: str) -> None:
+            super().__init__(f"shutdown failed: {name}")
+            self.name = name
+
+    def lifespan(name: str) -> Callable[[ASGIApp], AsyncIterator[None]]:
+        @asynccontextmanager
+        async def managed_app(app: ASGIApp) -> AsyncIterator[None]:
+            try:
+                yield
+            finally:
+                raise ShutdownFailure(name)
+
+        return managed_app
+
+    second = Starlette(lifespan=lifespan("second"))
+    first = Starlette(
+        lifespan=lifespan("first"),
+        routes=[Mount("/second", app=second)],
+    )
+    root = Starlette(
+        compose_mounted_lifespans=True,
+        lifespan=lifespan("root"),
+        routes=[Mount("/first", app=first)],
+    )
+
+    with pytest.raises(ShutdownFailure) as exc_info:
+        with test_client_factory(root):
+            pass
+
+    names = []
+    exception: BaseException | None = exc_info.value
+    while exception is not None:
+        names.append(getattr(exception, "name", None))
+        exception = exception.__context__
+
+    assert names == ["root", "first", "second"]
+
+
+def test_composed_mounted_lifespans_reject_cycles_before_startup(
+    test_client_factory: TestClientFactory,
+) -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def root_lifespan(app: ASGIApp) -> AsyncIterator[None]:
+        events.append("start:root")  # pragma: no cover
+        yield  # pragma: no cover
+
+    child = Starlette()
+    root = Starlette(
+        compose_mounted_lifespans=True,
+        lifespan=root_lifespan,
+        routes=[Mount("/child", app=child)],
+    )
+    child.router.routes.append(Mount("/root", app=root))
+
+    with pytest.raises(RuntimeError, match="cyclic mount graph"):
+        with test_client_factory(root):
+            pass  # pragma: no cover
+
+    assert events == []

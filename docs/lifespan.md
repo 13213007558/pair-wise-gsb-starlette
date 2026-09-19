@@ -73,6 +73,37 @@ app = Starlette(
 The `state` received on the requests is a **shallow** copy of the state received on the
 lifespan handler.
 
+## Composing mounted applications
+
+Mounted Starlette applications do not receive lifespan events by default. Pass
+`compose_mounted_lifespans=True` to the top-level application to make it responsible
+for starting and shutting down the Starlette applications in its mount tree:
+
+```python
+from starlette.routing import Mount
+
+app = Starlette(
+    routes=[Mount("/api", app=api)],
+    lifespan=lifespan,
+    compose_mounted_lifespans=True,
+)
+```
+
+The parent application starts first, followed by mounted applications in route
+declaration order. Nested mounts are traversed depth-first. On shutdown, applications
+exit in the reverse order from which they started. If the same application instance is
+mounted more than once, its lifespan is entered and exited only once.
+
+If startup fails, applications that already started are shut down before the failure
+is reported to the server. Applications that had not started do not receive shutdown.
+If more than one shutdown fails, every entered application is still shut down and all
+exceptions are preserved as chained exceptions.
+
+State yielded by a mounted application is available only to requests handled by that
+application. Parent state remains readable, and a child state key with the same name
+takes precedence. State changes made while handling one request do not leak to another
+request or to parent and sibling applications.
+
 ## Running lifespan in tests
 
 You should use `TestClient` as a context manager, to ensure that the lifespan is called.
