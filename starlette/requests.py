@@ -256,6 +256,8 @@ class Request(HTTPConnection):
         max_files: int | float = 1000,
         max_fields: int | float = 1000,
         max_part_size: int = 1024 * 1024,
+        max_file_size: int | None = None,
+        max_body_size: int | None = None,
     ) -> FormData:
         if self._form is None:  # pragma: no branch
             assert parse_options_header is not None, (
@@ -272,11 +274,13 @@ class Request(HTTPConnection):
                         max_files=max_files,
                         max_fields=max_fields,
                         max_part_size=max_part_size,
+                        max_file_size=max_file_size,
+                        max_body_size=max_body_size,
                     )
                     self._form = await multipart_parser.parse()
                 except MultiPartException as exc:
                     if "app" in self.scope:
-                        raise HTTPException(status_code=400, detail=exc.message)
+                        raise HTTPException(status_code=exc.status_code, detail=exc.message)
                     raise exc
             elif content_type == b"application/x-www-form-urlencoded":
                 form_parser = FormParser(self.headers, self.stream())
@@ -291,9 +295,17 @@ class Request(HTTPConnection):
         max_files: int | float = 1000,
         max_fields: int | float = 1000,
         max_part_size: int = 1024 * 1024,
+        max_file_size: int | None = None,
+        max_body_size: int | None = None,
     ) -> AwaitableOrContextManager[FormData]:
         return AwaitableOrContextManagerWrapper(
-            self._get_form(max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
+            self._get_form(
+                max_files=max_files,
+                max_fields=max_fields,
+                max_part_size=max_part_size,
+                max_file_size=max_file_size,
+                max_body_size=max_body_size,
+            )
         )
 
     async def close(self) -> None:

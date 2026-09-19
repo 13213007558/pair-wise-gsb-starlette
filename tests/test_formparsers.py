@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import AbstractContextManager, nullcontext as does_not_raise
 from io import BytesIO
 from pathlib import Path
@@ -10,12 +10,13 @@ from tempfile import SpooledTemporaryFile
 from typing import Any, ClassVar
 from unittest import mock
 
+import anyio
 import pytest
 
 from starlette.applications import Starlette
-from starlette.datastructures import UploadFile
+from starlette.datastructures import FormData, Headers, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser, _user_safe_decode
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -801,3 +802,379 @@ def test_max_part_size_exceeds_custom_limit(
         response = client.post("/", content=multipart_data, headers=headers)
         assert response.status_code == 400
         assert response.text == "Part exceeded maximum size of 10KB."
+
+
+def make_app_max_sizes(max_file_size: int | None = None, max_body_size: int | None = None) -> ASGIApp:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope, receive)
+        data = await request.form(max_file_size=max_file_size, max_body_size=max_body_size)
+        output: dict[str, Any] = {}
+        for key, value in data.items():
+            if isinstance(value, UploadFile):
+                content = await value.read()
+                output[key] = {
+                    "filename": value.filename,
+                    "size": value.size,
+                    "content": content.decode(),
+                    "content_type": value.content_type,
+                }
+            else:
+                output[key] = value
+        await request.close()
+        response = JSONResponse(output)
+        await response(scope, receive, send)
+
+    return app
+
+
+def encode_multipart(boundary: str, parts: list[tuple[str, bytes, str | None]]) -> bytes:
+    """Encode parts as (name, content, filename) tuples into a multipart body."""
+    chunks = []
+    for name, content, filename in parts:
+        disposition = f'Content-Disposition: form-data; name="{name}"'
+        if filename is not None:
+            disposition += f'; filename="{filename}"'
+        chunks.append(f"--{boundary}\r\n{disposition}\r\n\r\n".encode() + content + b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks)
+
+
+def multipart_headers(boundary: str, content_length: int | None = None) -> Headers:
+    raw = [(b"content-type", f"multipart/form-data; boundary={boundary}".encode())]
+    if content_length is not None:
+        raw.append((b"content-length", str(content_length).encode()))
+    return Headers(raw=raw)
+
+
+def chunked_stream(body: bytes, chunk_size: int, include_empty_chunks: bool = False) -> AsyncGenerator[bytes, None]:
+    async def stream() -> AsyncGenerator[bytes, None]:
+        for index in range(0, len(body), chunk_size):
+            if include_empty_chunks:
+                yield b""
+            yield body[index : index + chunk_size]
+        if include_empty_chunks:
+            yield b""
+
+    return stream()
+
+
+@pytest.mark.anyio
+async def test_max_body_size_multiple_files_exceeds_limit() -> None:
+    boundary = "boundary"
+    body = encode_multipart(
+        boundary,
+        [
+            ("file1", b"a" * 512, "file1.txt"),
+            ("file2", b"b" * 512, "file2.txt"),
+        ],
+    )
+    # No single part exceeds a limit, but the combined raw body does.
+    stream = chunked_stream(body, 64)
+    parser = MultiPartParser(
+        multipart_headers(boundary),
+        stream,
+        max_body_size=len(body) - 1,
+    )
+    with pytest.raises(MultiPartException, match=f"Request body exceeded maximum size of {len(body) - 1} bytes."):
+        await parser.parse()
+    await stream.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("chunk_size", [1, 7, 1024])
+async def test_max_body_size_equal_to_limit_succeeds(chunk_size: int) -> None:
+    boundary = "boundary"
+    body = encode_multipart(
+        boundary,
+        [
+            ("field", b"some value", None),
+            ("file", b"f" * 128, "file.txt"),
+        ],
+    )
+    parser = MultiPartParser(
+        multipart_headers(boundary),
+        chunked_stream(body, chunk_size, include_empty_chunks=True),
+        max_body_size=len(body),
+    )
+    form = await parser.parse()
+    assert form["field"] == "some value"
+    upload = form["file"]
+    assert isinstance(upload, UploadFile)
+    assert upload.size == 128
+    await form.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("content_length", [None, 5])
+async def test_max_body_size_ignores_content_length(content_length: int | None) -> None:
+    # The limit is enforced from the actual bytes received, so a missing or
+    # forged (too small) Content-Length header does not affect it.
+    boundary = "boundary"
+    body = encode_multipart(boundary, [("file", b"x" * 256, "file.txt")])
+    stream = chunked_stream(body, 32)
+    parser = MultiPartParser(
+        multipart_headers(boundary, content_length=content_length),
+        stream,
+        max_body_size=128,
+    )
+    with pytest.raises(MultiPartException, match="Request body exceeded maximum size of 128 bytes."):
+        await parser.parse()
+    await stream.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("chunk_size", [1, 13, 1024])
+async def test_max_file_size_only_one_file_exceeds(chunk_size: int) -> None:
+    boundary = "boundary"
+    body = encode_multipart(
+        boundary,
+        [
+            ("small", b"s" * 100, "small.txt"),
+            ("large", b"L" * 101, "large.txt"),
+        ],
+    )
+    stream = chunked_stream(body, chunk_size, include_empty_chunks=True)
+    parser = MultiPartParser(
+        multipart_headers(boundary),
+        stream,
+        max_file_size=100,
+    )
+    with pytest.raises(MultiPartException, match="File exceeded maximum size of 100 bytes."):
+        await parser.parse()
+    await stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_max_file_size_equal_to_limit_succeeds() -> None:
+    boundary = "boundary"
+    body = encode_multipart(
+        boundary,
+        [
+            ("file", b"a" * 100, "a.txt"),
+            ("file", b"b" * 100, "b.txt"),  # repeated field name
+        ],
+    )
+    parser = MultiPartParser(multipart_headers(boundary), chunked_stream(body, 3), max_file_size=100)
+    form = await parser.parse()
+    uploads = [value for _, value in form.multi_items()]
+    assert [upload.size for upload in uploads if isinstance(upload, UploadFile)] == [100, 100]
+    await form.close()
+
+
+@pytest.mark.anyio
+async def test_max_file_size_counts_file_content_only() -> None:
+    # Boundaries and headers count towards the body, but not towards the file limit.
+    boundary = "boundary"
+    body = encode_multipart(boundary, [("file", b"x" * 100, "file.txt")])
+    assert len(body) > 100
+    parser = MultiPartParser(multipart_headers(boundary), chunked_stream(body, 16), max_file_size=100)
+    form = await parser.parse()
+    upload = form["file"]
+    assert isinstance(upload, UploadFile)
+    assert upload.size == 100
+    await form.close()
+
+
+@pytest.mark.anyio
+async def test_max_body_size_closes_spooled_files_on_disk() -> None:
+    boundary = "boundary"
+    body = encode_multipart(
+        boundary,
+        [
+            ("file1", b"a" * 512, "file1.txt"),
+            ("file2", b"b" * 512, "file2.txt"),
+        ],
+    )
+    stream = chunked_stream(body, 64)
+    parser = MultiPartParser(multipart_headers(boundary), stream, max_body_size=len(body) - 1)
+    parser.spool_max_size = 10  # force the temporary files to roll over to disk
+    with pytest.raises(MultiPartException, match="Request body exceeded maximum size"):
+        await parser.parse()
+    await stream.aclose()
+    assert parser._files_to_close_on_error
+    for file in parser._files_to_close_on_error:
+        assert file._rolled  # the file content was actually written to disk
+        assert file.closed
+
+
+@pytest.mark.anyio
+async def test_max_file_size_closes_spooled_files_on_disk() -> None:
+    boundary = "boundary"
+    body = encode_multipart(boundary, [("file", b"x" * 512, "file.txt")])
+    stream = chunked_stream(body, 64)
+    parser = MultiPartParser(multipart_headers(boundary), stream, max_file_size=100)
+    parser.spool_max_size = 10
+    with pytest.raises(MultiPartException, match="File exceeded maximum size of 100 bytes."):
+        await parser.parse()
+    await stream.aclose()
+    assert parser._files_to_close_on_error
+    for file in parser._files_to_close_on_error:
+        assert file._rolled
+        assert file.closed
+
+
+@pytest.mark.anyio
+async def test_files_closed_on_stream_error() -> None:
+    boundary = "boundary"
+    first_chunk = encode_multipart(boundary, [("file", b"x" * 100, "file.txt")])[:200]
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield first_chunk
+        raise ClientDisconnect()
+
+    parser = MultiPartParser(multipart_headers(boundary), stream())
+    parser.spool_max_size = 10
+    with pytest.raises(ClientDisconnect):
+        await parser.parse()
+    assert parser._files_to_close_on_error
+    for file in parser._files_to_close_on_error:
+        assert file.closed
+
+
+@pytest.mark.anyio
+async def test_files_closed_and_cancellation_not_converted_on_cancel() -> None:
+    boundary = "boundary"
+    first_chunk = (
+        f"--{boundary}\r\n" f'Content-Disposition: form-data; name="file"; filename="file.txt"\r\n\r\n'
+    ).encode() + b"x" * 100
+    chunk_processed = anyio.Event()
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield first_chunk
+        chunk_processed.set()
+        await anyio.sleep_forever()
+
+    parser = MultiPartParser(multipart_headers(boundary), stream(), max_body_size=1024, max_file_size=1024)
+    parser.spool_max_size = 10
+    caught: list[BaseException] = []
+
+    async with anyio.create_task_group() as task_group:
+
+        async def parse() -> None:
+            try:
+                await parser.parse()
+            except BaseException as exc:
+                caught.append(exc)
+                raise
+
+        async def cancel_when_stalled() -> None:
+            await chunk_processed.wait()
+            task_group.cancel_scope.cancel()
+
+        task_group.start_soon(parse)
+        task_group.start_soon(cancel_when_stalled)
+
+    # The cancellation must propagate as-is, not be converted into a 413 error.
+    assert len(caught) == 1
+    assert isinstance(caught[0], anyio.get_cancelled_exc_class())
+    assert parser._files_to_close_on_error
+    for file in parser._files_to_close_on_error:
+        assert file.closed
+
+
+@pytest.mark.anyio
+async def test_form_data_close_closes_upload_files() -> None:
+    boundary = "boundary"
+    body = encode_multipart(
+        boundary,
+        [
+            ("field", b"value", None),
+            ("file", b"x" * 100, "file.txt"),
+        ],
+    )
+    parser = MultiPartParser(multipart_headers(boundary), chunked_stream(body, 16))
+    parser.spool_max_size = 10
+    form = await parser.parse()
+    assert isinstance(form, FormData)
+    upload = form["file"]
+    assert isinstance(upload, UploadFile)
+    assert upload.file._rolled
+    await form.close()
+    assert upload.file.closed
+
+
+@pytest.mark.parametrize(
+    "app,expectation",
+    [
+        (make_app_max_sizes(max_body_size=512), pytest.raises(MultiPartException)),
+        (
+            Starlette(routes=[Mount("/", app=make_app_max_sizes(max_body_size=512))]),
+            does_not_raise(),
+        ),
+    ],
+)
+def test_max_body_size_request_form_returns_413(
+    app: ASGIApp,
+    expectation: AbstractContextManager[Exception],
+    test_client_factory: TestClientFactory,
+) -> None:
+    client = test_client_factory(app)
+    boundary = "boundary"
+    multipart_data = encode_multipart(
+        boundary,
+        [
+            ("file1", b"a" * 300, "file1.txt"),
+            ("file2", b"b" * 300, "file2.txt"),
+        ],
+    )
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Transfer-Encoding": "chunked",
+    }
+    with expectation:
+        response = client.post("/", content=multipart_data, headers=headers)
+        assert response.status_code == 413
+        assert response.text == "Request body exceeded maximum size of 512 bytes."
+
+
+@pytest.mark.parametrize(
+    "app,expectation",
+    [
+        (make_app_max_sizes(max_file_size=100), pytest.raises(MultiPartException)),
+        (
+            Starlette(routes=[Mount("/", app=make_app_max_sizes(max_file_size=100))]),
+            does_not_raise(),
+        ),
+    ],
+)
+def test_max_file_size_request_form_returns_413(
+    app: ASGIApp,
+    expectation: AbstractContextManager[Exception],
+    test_client_factory: TestClientFactory,
+) -> None:
+    client = test_client_factory(app)
+    boundary = "boundary"
+    multipart_data = encode_multipart(
+        boundary,
+        [
+            ("small", b"s" * 100, "small.txt"),
+            ("large", b"L" * 101, "large.txt"),
+        ],
+    )
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Transfer-Encoding": "chunked",
+    }
+    with expectation:
+        response = client.post("/", content=multipart_data, headers=headers)
+        assert response.status_code == 413
+        assert response.text == "File exceeded maximum size of 100 bytes."
+
+
+def test_request_form_within_size_limits(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    client = test_client_factory(make_app_max_sizes(max_file_size=1024, max_body_size=1024 * 1024))
+    path = os.path.join(tmpdir, "test.txt")
+    with open(path, "wb") as file:
+        file.write(b"<file content>")
+    with open(path, "rb") as f:
+        response = client.post("/", data={"some": "data"}, files={"test": f})
+        assert response.status_code == 200
+        assert response.json() == {
+            "some": "data",
+            "test": {
+                "filename": "test.txt",
+                "size": 14,
+                "content": "<file content>",
+                "content_type": "text/plain",
+            },
+        }

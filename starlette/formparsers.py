@@ -50,8 +50,9 @@ def _user_safe_decode(src: bytes | bytearray, codec: str) -> str:
 
 
 class MultiPartException(Exception):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, status_code: int = 400) -> None:
         self.message = message
+        self.status_code = status_code
 
 
 class FormParser:
@@ -136,15 +137,20 @@ class MultiPartParser:
         max_files: int | float = 1000,
         max_fields: int | float = 1000,
         max_part_size: int = 1024 * 1024,  # 1MB
+        max_file_size: int | None = None,
+        max_body_size: int | None = None,
     ) -> None:
         assert multipart is not None, "The `python-multipart` library must be installed to use form parsing."
         self.headers = headers
         self.stream = stream
         self.max_files = max_files
         self.max_fields = max_fields
+        self.max_file_size = max_file_size
+        self.max_body_size = max_body_size
         self.items: list[tuple[str, str | UploadFile]] = []
         self._current_files = 0
         self._current_fields = 0
+        self._current_file_size = 0
         self._current_partial_header_name: bytes = b""
         self._current_partial_header_value: bytes = b""
         self._current_part = MultipartPart()
@@ -156,6 +162,7 @@ class MultiPartParser:
 
     def on_part_begin(self) -> None:
         self._current_part = MultipartPart()
+        self._current_file_size = 0
 
     def on_part_data(self, data: bytes, start: int, end: int) -> None:
         message_bytes = data[start:end]
@@ -164,6 +171,12 @@ class MultiPartParser:
                 raise MultiPartException(f"Part exceeded maximum size of {int(self.max_part_size / 1024)}KB.")
             self._current_part.data.extend(message_bytes)
         else:
+            self._current_file_size += len(message_bytes)
+            if self.max_file_size is not None and self._current_file_size > self.max_file_size:
+                raise MultiPartException(
+                    f"File exceeded maximum size of {self.max_file_size} bytes.",
+                    status_code=413,
+                )
             self._file_parts_to_write.append((self._current_part, message_bytes))
 
     def on_part_end(self) -> None:
@@ -249,9 +262,16 @@ class MultiPartParser:
 
         # Create the parser.
         parser = multipart.MultipartParser(boundary, callbacks)
+        body_size = 0
         try:
             # Feed the parser with data from the request.
             async for chunk in self.stream:
+                body_size += len(chunk)
+                if self.max_body_size is not None and body_size > self.max_body_size:
+                    raise MultiPartException(
+                        f"Request body exceeded maximum size of {self.max_body_size} bytes.",
+                        status_code=413,
+                    )
                 parser.write(chunk)
                 # Write file data, it needs to use await with the UploadFile methods
                 # that call the corresponding file methods *in a threadpool*,
@@ -266,11 +286,12 @@ class MultiPartParser:
                     await part.file.seek(0)
                 self._file_parts_to_write.clear()
                 self._file_parts_to_finish.clear()
-        except MultiPartException as exc:
-            # Close all the files if there was an error.
+        except BaseException:
+            # Close all the files if there was an error, a client disconnect
+            # or if the parsing task was cancelled.
             for file in self._files_to_close_on_error:
                 file.close()
-            raise exc
+            raise
 
         parser.finalize()
         return FormData(self.items)
