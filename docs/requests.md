@@ -113,17 +113,26 @@ state with `disconnected = await request.is_disconnected()`.
 
 Request files are normally sent as multipart form data (`multipart/form-data`).
 
-Signature: `request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024)`
+Signature: `request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024, max_body_size=None, max_file_size=None)`
 
-You can configure the number of maximum fields or files with the parameters `max_files` and `max_fields`; and part size using `max_part_size`:
+You can configure the number of fields or files with `max_files` and `max_fields`; the size of an individual text part with `max_part_size`; the total number of raw multipart request-body bytes (including boundaries and part headers) with `max_body_size`; and the content size of each individual uploaded file with `max_file_size`. A value of `None` means no additional limit:
 
 ```python
-async with request.form(max_files=1000, max_fields=1000, max_part_size=1024*1024):
+async with request.form(
+    max_files=1000,
+    max_fields=1000,
+    max_part_size=1024*1024,
+    max_body_size=10*1024*1024,
+    max_file_size=5*1024*1024,
+):
     ...
 ```
 
 !!! info
     These limits are for security reasons, allowing an unlimited number of fields or files could lead to a denial of service attack by consuming a lot of CPU and memory parsing too many empty fields.
+    The size limits are checked while parsing streamed data and do not trust `Content-Length`; request bodies and files that exceed the corresponding limit result in HTTP 413.
+
+`MultiPartParser` accepts the same parameters when used directly. It counts bytes while consuming the stream, including multipart boundaries and part headers for `max_body_size`, while `max_file_size` counts only file contents.
 
 When you call `async with request.form() as form` you receive a `starlette.datastructures.FormData` which is an immutable
 multidict, containing both file uploads and text input. File upload items are represented as instances of `starlette.datastructures.UploadFile`.

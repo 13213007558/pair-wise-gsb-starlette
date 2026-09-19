@@ -10,7 +10,13 @@ import anyio
 from starlette._utils import AwaitableOrContextManager, AwaitableOrContextManagerWrapper
 from starlette.datastructures import URL, Address, FormData, Headers, QueryParams, State
 from starlette.exceptions import HTTPException
-from starlette.formparsers import FormParser, MultiPartException, MultiPartParser
+from starlette.formparsers import (
+    FormParser,
+    MaxBodySizeException,
+    MaxFileSizeException,
+    MultiPartException,
+    MultiPartParser,
+)
 from starlette.types import Message, Receive, Scope, Send
 
 if TYPE_CHECKING:
@@ -256,11 +262,13 @@ class Request(HTTPConnection):
         max_files: int | float = 1000,
         max_fields: int | float = 1000,
         max_part_size: int = 1024 * 1024,
+        max_body_size: int | None = None,
+        max_file_size: int | None = None,
     ) -> FormData:
         if self._form is None:  # pragma: no branch
-            assert parse_options_header is not None, (
-                "The `python-multipart` library must be installed to use form parsing."
-            )
+            assert (
+                parse_options_header is not None
+            ), "The `python-multipart` library must be installed to use form parsing."
             content_type_header = self.headers.get("Content-Type")
             content_type: bytes
             content_type, _ = parse_options_header(content_type_header)
@@ -272,8 +280,14 @@ class Request(HTTPConnection):
                         max_files=max_files,
                         max_fields=max_fields,
                         max_part_size=max_part_size,
+                        max_body_size=max_body_size,
+                        max_file_size=max_file_size,
                     )
                     self._form = await multipart_parser.parse()
+                except (MaxBodySizeException, MaxFileSizeException) as exc:
+                    if "app" in self.scope:
+                        raise HTTPException(status_code=413, detail=exc.message)
+                    raise exc
                 except MultiPartException as exc:
                     if "app" in self.scope:
                         raise HTTPException(status_code=400, detail=exc.message)
@@ -291,9 +305,17 @@ class Request(HTTPConnection):
         max_files: int | float = 1000,
         max_fields: int | float = 1000,
         max_part_size: int = 1024 * 1024,
+        max_body_size: int | None = None,
+        max_file_size: int | None = None,
     ) -> AwaitableOrContextManager[FormData]:
         return AwaitableOrContextManagerWrapper(
-            self._get_form(max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
+            self._get_form(
+                max_files=max_files,
+                max_fields=max_fields,
+                max_part_size=max_part_size,
+                max_body_size=max_body_size,
+                max_file_size=max_file_size,
+            )
         )
 
     async def close(self) -> None:

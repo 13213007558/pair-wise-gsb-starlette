@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Added
+
+* Add `max_body_size` and `max_file_size` parameters to multipart form parsing.
+
 ## 0.47.3 (August 24, 2025)
 
 #### Fixed

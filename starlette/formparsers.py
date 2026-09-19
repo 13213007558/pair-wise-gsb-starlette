@@ -54,6 +54,14 @@ class MultiPartException(Exception):
         self.message = message
 
 
+class MaxBodySizeException(MultiPartException):
+    pass
+
+
+class MaxFileSizeException(MultiPartException):
+    pass
+
+
 class FormParser:
     def __init__(self, headers: Headers, stream: AsyncGenerator[bytes, None]) -> None:
         assert multipart is not None, "The `python-multipart` library must be installed to use form parsing."
@@ -123,6 +131,14 @@ class FormParser:
 
 
 class MultiPartParser:
+    """Parse multipart form data from a streaming request.
+
+    `max_body_size` counts every request-body byte consumed from the stream,
+    including boundaries and part headers. `max_file_size` counts only file
+    part contents and is applied independently to each file. Both limits use
+    `None` to remain unlimited.
+    """
+
     spool_max_size = 1024 * 1024  # 1MB
     """The maximum size of the spooled temporary file used to store file data."""
     max_part_size = 1024 * 1024  # 1MB
@@ -136,15 +152,21 @@ class MultiPartParser:
         max_files: int | float = 1000,
         max_fields: int | float = 1000,
         max_part_size: int = 1024 * 1024,  # 1MB
+        max_body_size: int | None = None,
+        max_file_size: int | None = None,
     ) -> None:
         assert multipart is not None, "The `python-multipart` library must be installed to use form parsing."
         self.headers = headers
         self.stream = stream
         self.max_files = max_files
         self.max_fields = max_fields
+        self.max_body_size = max_body_size
+        self.max_file_size = max_file_size
         self.items: list[tuple[str, str | UploadFile]] = []
         self._current_files = 0
         self._current_fields = 0
+        self._current_body_size = 0
+        self._current_file_size = 0
         self._current_partial_header_name: bytes = b""
         self._current_partial_header_value: bytes = b""
         self._current_part = MultipartPart()
@@ -156,6 +178,7 @@ class MultiPartParser:
 
     def on_part_begin(self) -> None:
         self._current_part = MultipartPart()
+        self._current_file_size = 0
 
     def on_part_data(self, data: bytes, start: int, end: int) -> None:
         message_bytes = data[start:end]
@@ -164,6 +187,9 @@ class MultiPartParser:
                 raise MultiPartException(f"Part exceeded maximum size of {int(self.max_part_size / 1024)}KB.")
             self._current_part.data.extend(message_bytes)
         else:
+            if self.max_file_size is not None and self._current_file_size + len(message_bytes) > self.max_file_size:
+                raise MaxFileSizeException(f"File exceeded maximum size of {self.max_file_size} bytes.")
+            self._current_file_size += len(message_bytes)
             self._file_parts_to_write.append((self._current_part, message_bytes))
 
     def on_part_end(self) -> None:
@@ -252,6 +278,10 @@ class MultiPartParser:
         try:
             # Feed the parser with data from the request.
             async for chunk in self.stream:
+                if self.max_body_size is not None:
+                    self._current_body_size += len(chunk)
+                    if self._current_body_size > self.max_body_size:
+                        raise MaxBodySizeException(f"Body exceeded maximum size of {self.max_body_size} bytes.")
                 parser.write(chunk)
                 # Write file data, it needs to use await with the UploadFile methods
                 # that call the corresponding file methods *in a threadpool*,
@@ -266,11 +296,14 @@ class MultiPartParser:
                     await part.file.seek(0)
                 self._file_parts_to_write.clear()
                 self._file_parts_to_finish.clear()
-        except MultiPartException as exc:
-            # Close all the files if there was an error.
+            parser.finalize()
+            form = FormData(self.items)
+            self._files_to_close_on_error.clear()
+        finally:
+            # Files retained in the returned form are closed through
+            # `FormData.close()` / `Request.close()`. Close every remaining file
+            # on cancellation, disconnection, read/write errors, and parse errors.
             for file in self._files_to_close_on_error:
                 file.close()
-            raise exc
 
-        parser.finalize()
-        return FormData(self.items)
+        return form
