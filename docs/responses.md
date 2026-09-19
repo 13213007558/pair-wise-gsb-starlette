@@ -184,6 +184,13 @@ async def app(scope, receive, send):
     await response(scope, receive, send)
 ```
 
+File responses support [conditional requests](https://www.rfc-editor.org/rfc/rfc9110#section-13), evaluated in the
+RFC 9110 order of precedence: `If-Match`, `If-Unmodified-Since`, `If-None-Match` and `If-Modified-Since`.
+ETag preconditions support lists of entity-tags, the `*` wildcard, and weak (`W/`) comparison where applicable.
+A failed precondition results in a `412 Precondition Failed` response, while an unmodified resource results in a
+`304 Not Modified` response. Neither response reads or sends the file content. Date preconditions with
+unparseable dates are ignored.
+
 File responses also supports [HTTP range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests).
 
 The `Accept-Ranges: bytes` header will be included in the response if the file exists. For now, only the `bytes`
@@ -191,6 +198,8 @@ range unit is supported.
 
 If the request includes a `Range` header, and the file exists, the response will be a `206 Partial Content` response
 with the requested range of bytes. If the range is invalid, the response will be a `416 Range Not Satisfiable` response.
+Range requests are only handled once the conditional request preconditions described above have passed, and honour
+the `If-Range` header.
 
 ## Third party responses
 

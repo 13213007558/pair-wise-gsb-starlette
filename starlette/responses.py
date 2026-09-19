@@ -9,8 +9,8 @@ import stat
 import sys
 import warnings
 from collections.abc import AsyncIterable, Awaitable, Iterable, Mapping, Sequence
-from datetime import datetime
-from email.utils import format_datetime, formatdate
+from datetime import datetime, timezone
+from email.utils import format_datetime, formatdate, parsedate_to_datetime
 from functools import partial
 from mimetypes import guess_type
 from secrets import token_hex
@@ -293,6 +293,97 @@ class RangeNotSatisfiable(Exception):
 
 _RANGE_PATTERN = re.compile(r"(\d*)-(\d*)")
 
+_ENTITY_TAG_PATTERN = re.compile(r'W/"[^"]*"|"[^"]*"|\*')
+
+# Headers that a "304 Not Modified" response should include, as per RFC 9110.
+_NOT_MODIFIED_HEADERS = ("cache-control", "content-location", "date", "etag", "expires", "vary")
+
+
+def _parse_http_date(value: str) -> datetime | None:
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        # A date without a timezone designation is assumed to be in GMT.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _parse_entity_tags(header_value: str) -> tuple[list[tuple[bool, str]], bool]:
+    """
+    Parse an If-Match/If-None-Match header into a list of
+    `(is_weak, opaque_tag)` pairs, plus a flag for the `*` wildcard.
+    """
+    tags: list[tuple[bool, str]] = []
+    any_tag = False
+    for match in _ENTITY_TAG_PATTERN.finditer(header_value):
+        token = match.group(0)
+        if token == "*":
+            any_tag = True
+        elif token.startswith("W/"):
+            tags.append((True, token[2:]))
+        else:
+            tags.append((False, token))
+    return tags, any_tag
+
+
+def _etag_matches(header_value: str, etag: str | None, *, strong: bool) -> bool:
+    tags, any_tag = _parse_entity_tags(header_value)
+    if any_tag:
+        # The wildcard matches any current representation, and the
+        # resource exists, given that we are about to serve it.
+        return True
+    if etag is None:
+        return False
+    current_is_weak = etag.startswith("W/")
+    current_tag = etag[2:] if current_is_weak else etag
+    for is_weak, tag in tags:
+        if strong and (is_weak or current_is_weak):
+            # Strong comparison requires both entity-tags to be strong.
+            continue
+        if tag == current_tag:
+            return True
+    return False
+
+
+def _evaluate_preconditions(request_headers: Headers, response_headers: Headers, method: str) -> int | None:
+    """
+    Evaluate the RFC 9110 preconditions If-Match, If-Unmodified-Since,
+    If-None-Match and If-Modified-Since, in that order of precedence.
+
+    Returns the status code that should be responded with, 304 or 412,
+    or None if all preconditions pass and the request should proceed.
+    """
+    etag = response_headers.get("etag")
+    last_modified = _parse_http_date(response_headers["last-modified"]) if "last-modified" in response_headers else None
+
+    if_match = request_headers.get("if-match")
+    if if_match is not None:
+        if not _etag_matches(if_match, etag, strong=True):
+            return 412
+    else:
+        # If-Unmodified-Since is ignored when If-Match is present.
+        if_unmodified_since = request_headers.get("if-unmodified-since")
+        if if_unmodified_since is not None and last_modified is not None:
+            unmodified_since = _parse_http_date(if_unmodified_since)
+            if unmodified_since is not None and last_modified > unmodified_since:
+                return 412
+
+    if_none_match = request_headers.get("if-none-match")
+    if if_none_match is not None:
+        if _etag_matches(if_none_match, etag, strong=False):
+            return 304 if method.upper() in ("GET", "HEAD") else 412
+    elif method.upper() in ("GET", "HEAD"):
+        # If-Modified-Since is ignored when If-None-Match is present.
+        if_modified_since = request_headers.get("if-modified-since")
+        if if_modified_since is not None and last_modified is not None:
+            modified_since = _parse_http_date(if_modified_since)
+            if modified_since is not None and last_modified <= modified_since:
+                return 304
+
+    return None
+
 
 class FileResponse(Response):
     chunk_size = 64 * 1024
@@ -365,7 +456,17 @@ class FileResponse(Response):
         http_range = headers.get("range")
         http_if_range = headers.get("if-range")
 
-        if http_range is None or (http_if_range is not None and not self._should_use_range(http_if_range)):
+        # Preconditions only apply to successful (200) responses. Error
+        # responses, such as the 404 page served in `StaticFiles` html mode,
+        # are always sent as-is.
+        precondition_status = (
+            _evaluate_preconditions(headers, self.headers, scope["method"]) if self.status_code == 200 else None
+        )
+        if precondition_status is not None:
+            # Preconditions failed, or the client already has a fresh
+            # representation. Respond without reading the file.
+            await self._handle_precondition(send, precondition_status)
+        elif http_range is None or (http_if_range is not None and not self._should_use_range(http_if_range)):
             await self._handle_simple(send, send_header_only, send_pathsend)
         else:
             try:
@@ -384,6 +485,16 @@ class FileResponse(Response):
 
         if self.background is not None:
             await self.background()
+
+    async def _handle_precondition(self, send: Send, status_code: int) -> None:
+        if status_code == 304:
+            headers = [
+                (key, value) for key, value in self.raw_headers if key.decode("latin-1") in _NOT_MODIFIED_HEADERS
+            ]
+            await send({"type": "http.response.start", "status": 304, "headers": headers})
+        else:
+            await send({"type": "http.response.start", "status": 412, "headers": [(b"content-length", b"0")]})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
 
     async def _handle_simple(self, send: Send, send_header_only: bool, send_pathsend: bool) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})

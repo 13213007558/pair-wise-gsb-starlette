@@ -9,6 +9,7 @@ import anyio
 import pytest
 
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -16,6 +17,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Mount
 from starlette.staticfiles import StaticFiles
+from starlette.types import Message, Scope
 from tests.types import TestClientFactory
 
 
@@ -250,6 +252,126 @@ def test_staticfiles_304_with_last_modified_compare_last_req(
     response = client.get("/example.txt", headers={"If-Modified-Since": "Thu, 20 Feb 2012 15:30:19 GMT"})
     assert response.status_code == 200
     assert response.content == b"<file content>"
+
+
+def test_staticfiles_if_none_match_star(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "example.txt")
+    with open(path, "w") as file:
+        file.write("<file content>")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+    response = client.get("/example.txt", headers={"if-none-match": "*"})
+    assert response.status_code == 304
+    assert response.content == b""
+
+
+def test_staticfiles_etag_mismatch_with_matching_if_modified_since(
+    tmpdir: Path, test_client_factory: TestClientFactory
+) -> None:
+    path = os.path.join(tmpdir, "example.txt")
+    with open(path, "w") as file:
+        file.write("<file content>")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+    first_resp = client.get("/example.txt")
+    assert first_resp.status_code == 200
+
+    # A non-matching `If-None-Match` takes precedence over a matching
+    # `If-Modified-Since`: the client needs the fresh representation.
+    response = client.get(
+        "/example.txt",
+        headers={
+            "if-none-match": '"outdated"',
+            "if-modified-since": first_resp.headers["last-modified"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.text == "<file content>"
+
+
+def test_staticfiles_if_match(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "example.txt")
+    with open(path, "w") as file:
+        file.write("<file content>")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+    first_resp = client.get("/example.txt")
+    etag = first_resp.headers["etag"]
+
+    response = client.get("/example.txt", headers={"if-match": etag})
+    assert response.status_code == 200
+    assert response.text == "<file content>"
+
+    response = client.get("/example.txt", headers={"if-match": '"outdated"'})
+    assert response.status_code == 412
+    assert response.content == b""
+
+    # `If-Match` uses strong comparison: weak entity-tags never match.
+    response = client.get("/example.txt", headers={"if-match": f"W/{etag}"})
+    assert response.status_code == 412
+
+
+def test_staticfiles_if_unmodified_since(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+    path = os.path.join(tmpdir, "example.txt")
+    with open(path, "w") as file:
+        file.write("<file content>")
+
+    app = StaticFiles(directory=tmpdir)
+    client = test_client_factory(app)
+    response = client.get("/example.txt", headers={"if-unmodified-since": "Thu, 01 Jan 1970 00:00:00 GMT"})
+    assert response.status_code == 412
+    assert response.content == b""
+
+    # An unparseable date is ignored.
+    response = client.get("/example.txt", headers={"if-unmodified-since": "not-a-date"})
+    assert response.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_staticfiles_not_modified_raw_asgi_messages(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    path.write_text("<file content>")
+
+    app = StaticFiles(directory=tmp_path)
+
+    async def request(
+        headers: list[tuple[bytes, bytes]],
+    ) -> tuple[dict[str, Any], list[bytes]]:
+        start_message: dict[str, Any] = {}
+        bodies: list[bytes] = []
+
+        async def receive() -> Message:
+            raise NotImplementedError("Should not be called!")
+
+        async def send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                start_message.update(message)
+            elif message["type"] == "http.response.body":
+                bodies.append(message["body"])
+
+        scope: Scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/example.txt",
+            "headers": headers,
+        }
+        await app(scope, receive, send)
+        return start_message, bodies
+
+    start_message, _ = await request([])
+    assert start_message["status"] == 200
+    etag = Headers(raw=start_message["headers"])["etag"]
+
+    start_message, bodies = await request([(b"if-none-match", etag.encode())])
+    assert start_message["status"] == 304
+    headers = Headers(raw=start_message["headers"])
+    assert headers["etag"] == etag
+    assert "content-length" not in headers
+    assert bodies == [b""]
 
 
 def test_staticfiles_html_normal(tmpdir: Path, test_client_factory: TestClientFactory) -> None:

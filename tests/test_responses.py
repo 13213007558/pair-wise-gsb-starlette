@@ -851,3 +851,210 @@ async def test_file_response_multi_small_chunk_size(readme_file: Path) -> None:
         b"\n",
         f"\n--{boundary}--\n".encode(),
     ]
+
+
+async def _file_response_messages(
+    path: Path,
+    headers: list[tuple[bytes, bytes]] | None = None,
+    method: str = "GET",
+    background: BackgroundTask | None = None,
+) -> tuple[dict[str, Any], list[bytes]]:
+    """
+    Exercise a `FileResponse` with raw ASGI messages, returning the
+    `http.response.start` message and the list of sent body chunks.
+    """
+    app = FileResponse(str(path), background=background)
+    start_message: dict[str, Any] = {}
+    bodies: list[bytes] = []
+
+    async def receive() -> Message:
+        raise NotImplementedError("Should not be called!")
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.start":
+            start_message.update(message)
+        elif message["type"] == "http.response.body":
+            bodies.append(message["body"])
+
+    scope: Scope = {"type": "http", "http_version": "1.1", "method": method, "headers": headers or []}
+    await app(scope, receive, send)
+    return start_message, bodies
+
+
+@pytest.mark.anyio
+async def test_file_response_if_none_match(readme_file: Path) -> None:
+    start_message, _ = await _file_response_messages(readme_file)
+    etag = Headers(raw=start_message["headers"])["etag"]
+
+    # Strong tags, weak tags, lists and the wildcard all match on GET.
+    for header_value in (etag, f"W/{etag}", f'"other", {etag}', "*"):
+        start_message, bodies = await _file_response_messages(readme_file, [(b"if-none-match", header_value.encode())])
+        assert start_message["status"] == 304
+        headers = Headers(raw=start_message["headers"])
+        assert headers["etag"] == etag
+        assert "content-length" not in headers
+        assert bodies == [b""]
+
+
+@pytest.mark.anyio
+async def test_file_response_if_none_match_mismatch_ignores_if_modified_since(readme_file: Path) -> None:
+    start_message, _ = await _file_response_messages(readme_file)
+    last_modified = Headers(raw=start_message["headers"])["last-modified"]
+
+    # A non-matching `If-None-Match` takes precedence over a matching
+    # `If-Modified-Since`: the client needs the fresh representation.
+    start_message, bodies = await _file_response_messages(
+        readme_file,
+        [(b"if-none-match", b'"outdated"'), (b"if-modified-since", last_modified.encode())],
+    )
+    assert start_message["status"] == 200
+    assert b"".join(bodies) == README.encode("utf8")
+
+
+@pytest.mark.anyio
+async def test_file_response_if_match(readme_file: Path) -> None:
+    start_message, _ = await _file_response_messages(readme_file)
+    etag = Headers(raw=start_message["headers"])["etag"]
+
+    for header_value in (etag, f'"other", {etag}', "*"):
+        start_message, bodies = await _file_response_messages(readme_file, [(b"if-match", header_value.encode())])
+        assert start_message["status"] == 200
+        assert b"".join(bodies) == README.encode("utf8")
+
+    # Weak entity-tags never match `If-Match`, which uses strong comparison.
+    for header_value in (f"W/{etag}", '"outdated"'):
+        start_message, bodies = await _file_response_messages(readme_file, [(b"if-match", header_value.encode())])
+        assert start_message["status"] == 412
+        headers = Headers(raw=start_message["headers"])
+        assert headers["content-length"] == "0"
+        assert bodies == [b""]
+
+
+@pytest.mark.anyio
+async def test_file_response_if_unmodified_since(readme_file: Path) -> None:
+    start_message, _ = await _file_response_messages(readme_file)
+    last_modified = Headers(raw=start_message["headers"])["last-modified"]
+
+    # Unmodified since the same second: the precondition passes.
+    start_message, _ = await _file_response_messages(readme_file, [(b"if-unmodified-since", last_modified.encode())])
+    assert start_message["status"] == 200
+
+    # Modified after the given date: the precondition fails.
+    start_message, bodies = await _file_response_messages(
+        readme_file, [(b"if-unmodified-since", b"Thu, 01 Jan 1970 00:00:00 GMT")]
+    )
+    assert start_message["status"] == 412
+    assert bodies == [b""]
+
+    # An unparseable date is ignored.
+    start_message, _ = await _file_response_messages(readme_file, [(b"if-unmodified-since", b"not-a-date")])
+    assert start_message["status"] == 200
+
+
+@pytest.mark.anyio
+async def test_file_response_if_modified_since(readme_file: Path) -> None:
+    start_message, _ = await _file_response_messages(readme_file)
+    last_modified = Headers(raw=start_message["headers"])["last-modified"]
+
+    start_message, bodies = await _file_response_messages(readme_file, [(b"if-modified-since", last_modified.encode())])
+    assert start_message["status"] == 304
+    assert bodies == [b""]
+
+    start_message, bodies = await _file_response_messages(
+        readme_file, [(b"if-modified-since", b"Thu, 01 Jan 1970 00:00:00 GMT")]
+    )
+    assert start_message["status"] == 200
+    assert b"".join(bodies) == README.encode("utf8")
+
+    # An unparseable date is ignored.
+    start_message, _ = await _file_response_messages(readme_file, [(b"if-modified-since", b"not-a-date")])
+    assert start_message["status"] == 200
+
+
+@pytest.mark.anyio
+async def test_file_response_if_match_takes_precedence_over_if_unmodified_since(readme_file: Path) -> None:
+    start_message, _ = await _file_response_messages(readme_file)
+    etag = Headers(raw=start_message["headers"])["etag"]
+
+    # `If-Unmodified-Since` is ignored when `If-Match` is present.
+    start_message, _ = await _file_response_messages(
+        readme_file,
+        [(b"if-match", etag.encode()), (b"if-unmodified-since", b"Thu, 01 Jan 1970 00:00:00 GMT")],
+    )
+    assert start_message["status"] == 200
+
+
+@pytest.mark.anyio
+async def test_file_response_preconditions_evaluated_before_range(readme_file: Path) -> None:
+    start_message, _ = await _file_response_messages(readme_file)
+    etag = Headers(raw=start_message["headers"])["etag"]
+
+    # A matching `If-None-Match` results in 304, even if a range is requested.
+    start_message, bodies = await _file_response_messages(
+        readme_file, [(b"if-none-match", etag.encode()), (b"range", b"bytes=0-100")]
+    )
+    assert start_message["status"] == 304
+    assert bodies == [b""]
+
+    # A failing `If-Match` results in 412, even if a range is requested.
+    start_message, bodies = await _file_response_messages(
+        readme_file, [(b"if-match", b'"outdated"'), (b"range", b"bytes=0-100")]
+    )
+    assert start_message["status"] == 412
+    assert bodies == [b""]
+
+    # Once the preconditions pass, the range request is handled as usual.
+    start_message, _ = await _file_response_messages(
+        readme_file, [(b"if-none-match", b'"outdated"'), (b"range", b"bytes=0-100")]
+    )
+    assert start_message["status"] == 206
+
+    start_message, _ = await _file_response_messages(
+        readme_file, [(b"if-match", etag.encode()), (b"range", b"bytes=1000000-")]
+    )
+    assert start_message["status"] == 416
+
+
+@pytest.mark.anyio
+async def test_file_response_conditional_head(readme_file: Path) -> None:
+    start_message, bodies = await _file_response_messages(readme_file, method="HEAD")
+    assert start_message["status"] == 200
+    headers = Headers(raw=start_message["headers"])
+    assert headers["content-length"] == str(len(README.encode("utf8")))
+    assert bodies == [b""]
+
+    start_message, bodies = await _file_response_messages(
+        readme_file, [(b"if-none-match", headers["etag"].encode())], method="HEAD"
+    )
+    assert start_message["status"] == 304
+    assert bodies == [b""]
+
+    start_message, bodies = await _file_response_messages(readme_file, [(b"if-match", b'"outdated"')], method="HEAD")
+    assert start_message["status"] == 412
+    assert Headers(raw=start_message["headers"])["content-length"] == "0"
+    assert bodies == [b""]
+
+
+@pytest.mark.anyio
+async def test_file_response_background_task_with_preconditions(readme_file: Path) -> None:
+    task_run = False
+
+    async def task() -> None:
+        nonlocal task_run
+        task_run = True
+
+    start_message, _ = await _file_response_messages(readme_file)
+    etag = Headers(raw=start_message["headers"])["etag"]
+
+    start_message, _ = await _file_response_messages(
+        readme_file, [(b"if-none-match", etag.encode())], background=BackgroundTask(task)
+    )
+    assert start_message["status"] == 304
+    assert task_run
+
+    task_run = False
+    start_message, _ = await _file_response_messages(
+        readme_file, [(b"if-match", b'"outdated"')], background=BackgroundTask(task)
+    )
+    assert start_message["status"] == 412
+    assert task_run

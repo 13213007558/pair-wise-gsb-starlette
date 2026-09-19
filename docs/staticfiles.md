@@ -32,6 +32,13 @@ Static files will respond with "404 Not found" or "405 Method not allowed"
 responses for requests which do not match. In HTML mode if `404.html` file
 exists it will be shown as 404 response.
 
+Served files include `ETag` and `Last-Modified` headers, and support
+[conditional requests](https://www.rfc-editor.org/rfc/rfc9110#section-13),
+evaluated in the RFC 9110 order of precedence: `If-Match`, `If-Unmodified-Since`,
+`If-None-Match` and `If-Modified-Since`. Failed preconditions result in
+`412 Precondition Failed`, and unmodified resources in `304 Not Modified`,
+matching the behaviour of `FileResponse`.
+
 The `packages` option can be used to include "static" directories contained within
 a python package. The Python "bootstrap4" package is an example of this.
 
