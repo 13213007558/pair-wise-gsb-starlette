@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
@@ -17,7 +18,7 @@ from starlette.datastructures import Headers
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.testclient import TestClient
-from starlette.types import Message, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from tests.types import TestClientFactory
 
 
@@ -759,6 +760,231 @@ def test_file_response_range_must_be_requested(file_response_client: TestClient)
     response = file_response_client.get("/", headers={"Range": "bytes="})
     assert response.status_code == 400
     assert response.text == "Range header: range must be requested"
+
+
+async def raw_request(
+    app: ASGIApp,
+    method: str = "GET",
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> tuple[Message, list[Message]]:
+    start_message: Message = {}
+    body_messages: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.start":
+            start_message.update(message)
+        else:
+            body_messages.append(message)
+
+    scope: Scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers or [],
+        "client": ("127.0.0.1", 123),
+        "server": ("testserver", 80),
+    }
+    await app(scope, receive, send)
+    return start_message, body_messages
+
+
+def body_of(body_messages: list[Message]) -> bytes:
+    return b"".join(message["body"] for message in body_messages)
+
+
+@pytest.fixture
+def conditional_file(tmp_path: Path) -> Path:
+    filepath = tmp_path / "example.txt"
+    filepath.write_bytes(b"<file content>")
+    mtime = time.mktime((2013, 10, 10, 23, 40, 0, 0, 0, -1))
+    os.utime(filepath, (mtime, mtime))
+    return filepath
+
+
+async def file_response_validators(app: ASGIApp) -> tuple[str, str]:
+    start_message, _ = await raw_request(app)
+    headers = Headers(raw=start_message["headers"])
+    return headers["etag"], headers["last-modified"]
+
+
+@pytest.mark.anyio
+async def test_file_response_if_match(conditional_file: Path) -> None:
+    app = FileResponse(str(conditional_file))
+    etag, _ = await file_response_validators(app)
+
+    # A matching entity-tag passes the precondition.
+    start_message, body_messages = await raw_request(app, headers=[(b"if-match", etag.encode())])
+    assert start_message["status"] == 200
+    assert body_of(body_messages) == b"<file content>"
+
+    # Lists and the wildcard are supported.
+    start_message, _ = await raw_request(app, headers=[(b"if-match", f'"other", {etag}'.encode())])
+    assert start_message["status"] == 200
+    start_message, _ = await raw_request(app, headers=[(b"if-match", b"*")])
+    assert start_message["status"] == 200
+
+    # If-Match uses the strong comparison: weak entity-tags never match.
+    start_message, body_messages = await raw_request(app, headers=[(b"if-match", f"W/{etag}".encode())])
+    assert start_message["status"] == 412
+    assert body_of(body_messages) == b""
+
+    start_message, body_messages = await raw_request(app, headers=[(b"if-match", b'"other"')])
+    assert start_message["status"] == 412
+    assert body_of(body_messages) == b""
+    headers = Headers(raw=start_message["headers"])
+    assert headers["etag"] == etag
+    assert headers["content-length"] == "0"
+
+
+@pytest.mark.anyio
+async def test_file_response_if_unmodified_since(conditional_file: Path) -> None:
+    app = FileResponse(str(conditional_file))
+    _, last_modified = await file_response_validators(app)
+
+    start_message, _ = await raw_request(app, headers=[(b"if-unmodified-since", last_modified.encode())])
+    assert start_message["status"] == 200
+
+    start_message, body_messages = await raw_request(
+        app, headers=[(b"if-unmodified-since", b"Thu, 20 Feb 2012 15:30:19 GMT")]
+    )
+    assert start_message["status"] == 412
+    assert body_of(body_messages) == b""
+
+    # Dates that cannot be parsed are ignored.
+    start_message, _ = await raw_request(app, headers=[(b"if-unmodified-since", b"not a date")])
+    assert start_message["status"] == 200
+
+    # If-Match takes precedence over If-Unmodified-Since.
+    etag, _ = await file_response_validators(app)
+    start_message, _ = await raw_request(
+        app, headers=[(b"if-match", etag.encode()), (b"if-unmodified-since", b"Thu, 20 Feb 2012 15:30:19 GMT")]
+    )
+    assert start_message["status"] == 200
+
+
+@pytest.mark.anyio
+async def test_file_response_if_none_match(conditional_file: Path) -> None:
+    app = FileResponse(str(conditional_file))
+    etag, _ = await file_response_validators(app)
+
+    # If-None-Match uses the weak comparison.
+    start_message, body_messages = await raw_request(app, headers=[(b"if-none-match", f"W/{etag}".encode())])
+    assert start_message["status"] == 304
+    assert body_of(body_messages) == b""
+
+    # The wildcard matches any existing representation.
+    start_message, _ = await raw_request(app, headers=[(b"if-none-match", b"*")])
+    assert start_message["status"] == 304
+
+    start_message, body_messages = await raw_request(app, headers=[(b"if-none-match", b'"other"')])
+    assert start_message["status"] == 200
+    assert body_of(body_messages) == b"<file content>"
+
+    # A 304 response only includes the validator headers.
+    start_message, body_messages = await raw_request(app, headers=[(b"if-none-match", etag.encode())])
+    assert start_message["status"] == 304
+    headers = Headers(raw=start_message["headers"])
+    assert headers["etag"] == etag
+    assert "content-length" not in headers
+    assert body_of(body_messages) == b""
+
+
+@pytest.mark.anyio
+async def test_file_response_etag_preconditions_take_precedence_over_dates(conditional_file: Path) -> None:
+    app = FileResponse(str(conditional_file))
+    etag, last_modified = await file_response_validators(app)
+
+    # A mismatching If-None-Match must not be overridden by a matching If-Modified-Since.
+    start_message, body_messages = await raw_request(
+        app, headers=[(b"if-none-match", b'"other"'), (b"if-modified-since", last_modified.encode())]
+    )
+    assert start_message["status"] == 200
+    assert body_of(body_messages) == b"<file content>"
+
+    # A failing If-Match takes precedence over a matching If-None-Match.
+    start_message, _ = await raw_request(app, headers=[(b"if-match", b'"other"'), (b"if-none-match", etag.encode())])
+    assert start_message["status"] == 412
+
+
+@pytest.mark.anyio
+async def test_file_response_preconditions_are_evaluated_before_range(conditional_file: Path) -> None:
+    app = FileResponse(str(conditional_file))
+    etag, _ = await file_response_validators(app)
+
+    # Preconditions pass: the range request is handled as usual.
+    start_message, body_messages = await raw_request(
+        app, headers=[(b"if-match", etag.encode()), (b"range", b"bytes=0-3")]
+    )
+    assert start_message["status"] == 206
+    assert body_of(body_messages) == b"<fil"
+
+    # A matching If-None-Match results in 304, ignoring the Range header.
+    start_message, body_messages = await raw_request(
+        app, headers=[(b"if-none-match", etag.encode()), (b"range", b"bytes=0-3")]
+    )
+    assert start_message["status"] == 304
+    assert body_of(body_messages) == b""
+
+    # A failing If-Match results in 412, ignoring the Range header.
+    start_message, _ = await raw_request(app, headers=[(b"if-match", b'"other"'), (b"range", b"bytes=0-3")])
+    assert start_message["status"] == 412
+
+    # A matching If-None-Match takes precedence over an unsatisfiable range.
+    start_message, _ = await raw_request(app, headers=[(b"if-none-match", etag.encode()), (b"range", b"bytes=1000-")])
+    assert start_message["status"] == 304
+
+    # An unsatisfiable range still results in 416 once the preconditions pass.
+    start_message, _ = await raw_request(app, headers=[(b"if-match", etag.encode()), (b"range", b"bytes=1000-")])
+    assert start_message["status"] == 416
+
+
+@pytest.mark.anyio
+async def test_file_response_conditional_head(conditional_file: Path) -> None:
+    app = FileResponse(str(conditional_file))
+    etag, _ = await file_response_validators(app)
+
+    start_message, body_messages = await raw_request(app, method="HEAD", headers=[(b"if-none-match", etag.encode())])
+    assert start_message["status"] == 304
+    assert body_of(body_messages) == b""
+
+    start_message, body_messages = await raw_request(app, method="HEAD", headers=[(b"if-match", b'"other"')])
+    assert start_message["status"] == 412
+    assert body_of(body_messages) == b""
+
+    start_message, body_messages = await raw_request(app, method="HEAD")
+    assert start_message["status"] == 200
+    headers = Headers(raw=start_message["headers"])
+    assert headers["content-length"] == str(len(b"<file content>"))
+    assert body_of(body_messages) == b""
+
+
+@pytest.mark.anyio
+async def test_file_response_conditional_background(conditional_file: Path) -> None:
+    ran_background = False
+
+    async def background() -> None:
+        nonlocal ran_background
+        ran_background = True
+
+    app = FileResponse(str(conditional_file), background=BackgroundTask(background))
+    etag, _ = await file_response_validators(app)
+
+    start_message, _ = await raw_request(app, headers=[(b"if-none-match", etag.encode())])
+    assert start_message["status"] == 304
+    assert ran_background
+
+    ran_background = False
+    start_message, _ = await raw_request(app, headers=[(b"if-match", b'"other"')])
+    assert start_message["status"] == 412
+    assert ran_background
 
 
 def test_file_response_start_must_be_less_than_end(file_response_client: TestClient) -> None:

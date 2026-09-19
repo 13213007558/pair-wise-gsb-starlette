@@ -4,36 +4,18 @@ import errno
 import importlib.util
 import os
 import stat
-from email.utils import parsedate
 from typing import Union
 
 import anyio
 import anyio.to_thread
 
-from starlette._utils import get_route_path
+from starlette._utils import evaluate_preconditions, get_route_path
 from starlette.datastructures import URL, Headers
 from starlette.exceptions import HTTPException
-from starlette.responses import FileResponse, RedirectResponse, Response
+from starlette.responses import FileResponse, NotModifiedResponse, RedirectResponse, Response
 from starlette.types import Receive, Scope, Send
 
 PathLike = Union[str, "os.PathLike[str]"]
-
-
-class NotModifiedResponse(Response):
-    NOT_MODIFIED_HEADERS = (
-        "cache-control",
-        "content-location",
-        "date",
-        "etag",
-        "expires",
-        "vary",
-    )
-
-    def __init__(self, headers: Headers):
-        super().__init__(
-            status_code=304,
-            headers={name: value for name, value in headers.items() if name in self.NOT_MODIFIED_HEADERS},
-        )
 
 
 class StaticFiles:
@@ -77,9 +59,9 @@ class StaticFiles:
             assert spec is not None, f"Package {package!r} could not be found."
             assert spec.origin is not None, f"Package {package!r} could not be found."
             package_directory = os.path.normpath(os.path.join(spec.origin, "..", statics_dir))
-            assert os.path.isdir(package_directory), (
-                f"Directory '{statics_dir!r}' in package {package!r} could not be found."
-            )
+            assert os.path.isdir(
+                package_directory
+            ), f"Directory '{statics_dir!r}' in package {package!r} could not be found."
             directories.append(package_directory)
 
         return directories
@@ -201,20 +183,4 @@ class StaticFiles:
         Given the request and response headers, return `True` if an HTTP
         "Not Modified" response could be returned instead.
         """
-        try:
-            if_none_match = request_headers["if-none-match"]
-            etag = response_headers["etag"]
-            if etag in [tag.strip(" W/") for tag in if_none_match.split(",")]:
-                return True
-        except KeyError:
-            pass
-
-        try:
-            if_modified_since = parsedate(request_headers["if-modified-since"])
-            last_modified = parsedate(response_headers["last-modified"])
-            if if_modified_since is not None and last_modified is not None and if_modified_since >= last_modified:
-                return True
-        except KeyError:
-            pass
-
-        return False
+        return evaluate_preconditions(request_headers, response_headers, "GET") == 304

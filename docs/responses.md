@@ -174,6 +174,14 @@ Takes a different set of arguments to instantiate than the other response types:
 
 File responses will include appropriate `Content-Length`, `Last-Modified` and `ETag` headers.
 
+File responses evaluate the `If-Match`, `If-Unmodified-Since`, `If-None-Match` and `If-Modified-Since`
+conditional request headers against those validators, following the precedence order of
+[RFC 9110 section 13.2.2](https://www.rfc-editor.org/rfc/rfc9110#section-13.2.2). Entity-tag conditions
+support lists and the `*` wildcard, use the strong comparison for `If-Match` and the weak comparison
+for `If-None-Match`, and take precedence over the date-based conditions. Date headers that cannot be
+parsed are ignored. A failed precondition results in a `412 Precondition Failed` response, and an
+unmodified resource results in a `304 Not Modified` response, without the file content being read.
+
 ```python
 from starlette.responses import FileResponse
 

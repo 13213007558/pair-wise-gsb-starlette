@@ -1,10 +1,18 @@
+from __future__ import annotations
+
 import functools
 from typing import Any
 from unittest.mock import create_autospec
 
 import pytest
 
-from starlette._utils import get_route_path, is_async_callable
+from starlette._utils import (
+    evaluate_preconditions,
+    get_route_path,
+    is_async_callable,
+    parse_entity_tags,
+    parse_http_date,
+)
 from starlette.types import Scope
 
 
@@ -102,3 +110,75 @@ def test_async_mocked_async_function() -> None:
 )
 def test_get_route_path(scope: Scope, expected_result: str) -> None:
     assert get_route_path(scope) == expected_result
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ('"abc"', [(False, '"abc"')]),
+        ('W/"abc"', [(True, '"abc"')]),
+        ("*", [(False, "*")]),
+        ('W/"abc", "123", *', [(True, '"abc"'), (False, '"123"'), (False, "*")]),
+        ('  "abc" ,  W/"def" ', [(False, '"abc"'), (True, '"def"')]),
+        ("", []),
+    ],
+)
+def test_parse_entity_tags(value: str, expected: list[tuple[bool, str]]) -> None:
+    assert parse_entity_tags(value) == expected
+
+
+@pytest.mark.parametrize("value", ['"unclosed', "abc", '"a" junk', 'W/"a" W/"b"'])
+def test_parse_entity_tags_malformed(value: str) -> None:
+    assert parse_entity_tags(value) is None
+
+
+def test_parse_http_date() -> None:
+    assert parse_http_date("Thu, 11 Oct 2013 15:30:19 GMT") is not None
+    assert parse_http_date("not a date") is None
+    assert parse_http_date("") is None
+
+
+ETAG = '"abc"'
+LAST_MODIFIED = "Thu, 11 Oct 2013 15:30:19 GMT"
+EARLIER = "Thu, 11 Oct 2013 15:30:18 GMT"
+LATER = "Thu, 11 Oct 2013 15:30:20 GMT"
+RESPONSE_HEADERS = {"etag": ETAG, "last-modified": LAST_MODIFIED}
+
+
+@pytest.mark.parametrize(
+    "request_headers, method, expected",
+    [
+        # If-Match uses the strong comparison.
+        ({"if-match": ETAG}, "GET", None),
+        ({"if-match": f"W/{ETAG}"}, "GET", 412),
+        ({"if-match": '"other"'}, "GET", 412),
+        ({"if-match": "*"}, "GET", None),
+        ({"if-match": f'"other", {ETAG}'}, "GET", None),
+        # If-Unmodified-Since is only evaluated when If-Match is absent.
+        ({"if-unmodified-since": LATER}, "GET", None),
+        ({"if-unmodified-since": EARLIER}, "GET", 412),
+        ({"if-unmodified-since": "not a date"}, "GET", None),
+        ({"if-match": ETAG, "if-unmodified-since": EARLIER}, "GET", None),
+        # If-None-Match uses the weak comparison, and takes precedence over If-Modified-Since.
+        ({"if-none-match": ETAG}, "GET", 304),
+        ({"if-none-match": f"W/{ETAG}"}, "GET", 304),
+        ({"if-none-match": "*"}, "GET", 304),
+        ({"if-none-match": '"other"'}, "GET", None),
+        ({"if-none-match": ETAG}, "HEAD", 304),
+        ({"if-none-match": ETAG}, "POST", 412),
+        ({"if-none-match": '"other"', "if-modified-since": LATER}, "GET", None),
+        # If-Modified-Since is only evaluated when If-None-Match is absent.
+        ({"if-modified-since": LAST_MODIFIED}, "GET", 304),
+        ({"if-modified-since": LATER}, "GET", 304),
+        ({"if-modified-since": EARLIER}, "GET", None),
+        ({"if-modified-since": "not a date"}, "GET", None),
+        ({"if-modified-since": LAST_MODIFIED}, "POST", None),
+        # If-Match failures take precedence over If-None-Match.
+        ({"if-match": '"other"', "if-none-match": ETAG}, "GET", 412),
+        # Malformed entity-tag lists are ignored.
+        ({"if-match": "junk"}, "GET", None),
+        ({"if-none-match": "junk"}, "GET", None),
+    ],
+)
+def test_evaluate_preconditions(request_headers: dict[str, str], method: str, expected: int | None) -> None:
+    assert evaluate_preconditions(request_headers, RESPONSE_HEADERS, method) == expected

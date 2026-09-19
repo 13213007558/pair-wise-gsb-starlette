@@ -20,7 +20,7 @@ from urllib.parse import quote
 import anyio
 import anyio.to_thread
 
-from starlette._utils import collapse_excgroups
+from starlette._utils import collapse_excgroups, evaluate_preconditions
 from starlette.background import BackgroundTask
 from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import URL, Headers, MutableHeaders
@@ -294,6 +294,31 @@ class RangeNotSatisfiable(Exception):
 _RANGE_PATTERN = re.compile(r"(\d*)-(\d*)")
 
 
+class NotModifiedResponse(Response):
+    NOT_MODIFIED_HEADERS = (
+        "cache-control",
+        "content-location",
+        "date",
+        "etag",
+        "expires",
+        "vary",
+    )
+
+    def __init__(self, headers: Mapping[str, str]):
+        super().__init__(
+            status_code=304,
+            headers={name: value for name, value in headers.items() if name.lower() in self.NOT_MODIFIED_HEADERS},
+        )
+
+
+class PreconditionFailedResponse(Response):
+    def __init__(self, headers: Mapping[str, str]):
+        validator_headers = {
+            name: value for name, value in headers.items() if name.lower() in ("etag", "last-modified")
+        }
+        super().__init__(status_code=412, headers=validator_headers)
+
+
 class FileResponse(Response):
     chunk_size = 64 * 1024
 
@@ -362,6 +387,43 @@ class FileResponse(Response):
             stat_result = self.stat_result
 
         headers = Headers(scope=scope)
+
+        # Preconditions are only evaluated when the response would
+        # otherwise be a 200 (OK), per RFC 9110 section 13.2.2.
+        precondition_status = (
+            evaluate_preconditions(headers, self.headers, scope["method"]) if self.status_code == 200 else None
+        )
+        if precondition_status == 304:
+            response: Response = NotModifiedResponse(self.headers)
+            await response(scope, receive, send)
+            run_background = True
+        elif precondition_status is not None:
+            response = PreconditionFailedResponse(self.headers)
+            await response(scope, receive, send)
+            run_background = True
+        else:
+            run_background = await self._send_content(
+                scope, receive, send, headers, stat_result, send_header_only, send_pathsend
+            )
+
+        if run_background and self.background is not None:
+            await self.background()
+
+    async def _send_content(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        headers: Headers,
+        stat_result: os.stat_result,
+        send_header_only: bool,
+        send_pathsend: bool,
+    ) -> bool:
+        """
+        Send the response content. Returns False if the response completed
+        early with an error status, in which case the background task,
+        if any, is not run.
+        """
         http_range = headers.get("range")
         http_if_range = headers.get("if-range")
 
@@ -371,19 +433,19 @@ class FileResponse(Response):
             try:
                 ranges = self._parse_range_header(http_range, stat_result.st_size)
             except MalformedRangeHeader as exc:
-                return await PlainTextResponse(exc.content, status_code=400)(scope, receive, send)
+                await PlainTextResponse(exc.content, status_code=400)(scope, receive, send)
+                return False
             except RangeNotSatisfiable as exc:
                 response = PlainTextResponse(status_code=416, headers={"Content-Range": f"*/{exc.max_size}"})
-                return await response(scope, receive, send)
+                await response(scope, receive, send)
+                return False
 
             if len(ranges) == 1:
                 start, end = ranges[0]
                 await self._handle_single_range(send, start, end, stat_result.st_size, send_header_only)
             else:
                 await self._handle_multiple_ranges(send, ranges, stat_result.st_size, send_header_only)
-
-        if self.background is not None:
-            await self.background()
+        return True
 
     async def _handle_simple(self, send: Send, send_header_only: bool, send_pathsend: bool) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
