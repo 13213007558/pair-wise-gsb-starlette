@@ -107,10 +107,25 @@ class Starlette:
         return self.router.url_path_for(name, **path_params)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        previous_state = scope.get("state")
+        composed_state = self.router.composed_lifespan_state
+        state = composed_state if scope["type"] in ("http", "websocket") else None
+        if state is not None:
+            parent_state: Mapping[str, Any] = previous_state if previous_state is not None else {}
+            request_state = dict(parent_state)
+            request_state.update(state)
+            scope["state"] = request_state
         scope["app"] = self
-        if self.middleware_stack is None:
-            self.middleware_stack = self.build_middleware_stack()
-        await self.middleware_stack(scope, receive, send)
+        try:
+            if self.middleware_stack is None:
+                self.middleware_stack = self.build_middleware_stack()
+            await self.middleware_stack(scope, receive, send)
+        finally:
+            if state is not None:
+                if previous_state is None:
+                    scope.pop("state", None)
+                else:
+                    scope["state"] = previous_state
 
     def on_event(self, event_type: str) -> Callable:  # type: ignore[type-arg]
         return self.router.on_event(event_type)  # pragma: no cover

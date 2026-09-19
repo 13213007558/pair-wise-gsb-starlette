@@ -7,7 +7,7 @@ import re
 import traceback
 import types
 import warnings
-from collections.abc import Awaitable, Collection, Generator, Sequence
+from collections.abc import Awaitable, Collection, Generator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager
 from enum import Enum
 from re import Pattern
@@ -596,6 +596,8 @@ class Router:
         self.default = self.not_found if default is None else default
         self.on_startup = [] if on_startup is None else list(on_startup)
         self.on_shutdown = [] if on_shutdown is None else list(on_shutdown)
+        self.composed_lifespan_active = False
+        self.composed_lifespan_state: Mapping[str, Any] | None = None
 
         if on_startup or on_shutdown:
             warnings.warn(

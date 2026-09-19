@@ -90,3 +90,32 @@ def test_homepage():
 
     # And the lifespan's teardown is run when exiting the block.
 ```
+
+## Composing mounted application lifespans
+
+Mounted Starlette applications do not run their lifespan handlers by default.
+To explicitly delegate their startup and shutdown to the parent application,
+pass `composed_lifespan(...)` as the parent's lifespan:
+
+```python
+from starlette.applications import Starlette
+from starlette.lifespan import composed_lifespan
+from starlette.routing import Mount
+
+parent = Starlette(
+    routes=[Mount("/api", app=api)],
+    lifespan=composed_lifespan(parent_lifespan),
+)
+```
+
+Call `composed_lifespan()` without an argument when the parent has no lifespan
+state. Lifespans start parent-first and then traverse mounted applications in
+route declaration order, including nested mounts. Shutdown runs in the reverse
+order. If startup fails, only applications that entered successfully are shut
+down. Mounting the same application instance more than once starts it once, and
+cyclic mounts raise before any lifespan side effects occur.
+
+State yielded by a mounted application is visible to requests handled by that
+application. Parent state remains readable, but a mounted application's state
+takes precedence for keys with the same name. Child state is not copied into the
+parent or sibling applications.
