@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import functools
 import inspect
 import re
+import threading
 import traceback
 import types
 import warnings
@@ -11,7 +13,7 @@ from collections.abc import Awaitable, Collection, Generator, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, asynccontextmanager
 from enum import Enum
 from re import Pattern
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, NamedTuple, TypeVar
 
 from starlette._exception_handler import wrap_app_handling_exceptions
 from starlette._utils import get_route_path, is_async_callable
@@ -532,6 +534,172 @@ class Host(BaseRoute):
         return f"{class_name}(host={self.host!r}, name={name!r}, app={self.app!r})"
 
 
+class RouteTableError(ValueError):
+    """
+    Raised by `Router.publish(routes)` when the candidate route table fails
+    validation. Publishing is all-or-nothing: when this error is raised the
+    previously published route table and its version number remain in effect.
+
+    The individual validation problems are available as `.errors`.
+    """
+
+    def __init__(self, errors: Collection[str]) -> None:
+        self.errors = list(errors)
+        super().__init__("; ".join(self.errors))
+
+
+class PublishRecord(NamedTuple):
+    """
+    Trace entry recording a successful route table publish, in the order the
+    publishes were serialized.
+    """
+
+    version: int
+    route_count: int
+
+
+class RollbackRecord(NamedTuple):
+    """
+    Trace entry recording a failed route table publish. `version` is the
+    version of the route table that remained in effect after the rollback.
+    """
+
+    version: int
+    errors: tuple[str, ...]
+
+
+def _mounted_router(route: BaseRoute) -> Router | None:
+    app: Any = None
+    if isinstance(route, Mount):
+        app = route._base_app
+    elif isinstance(route, Host):
+        app = route.app
+    if isinstance(app, Router):
+        return app
+    return None
+
+
+def _validate_routes(routes: Sequence[BaseRoute], _seen: tuple[int, ...] = ()) -> list[str]:
+    """
+    Validate a candidate route table before it is published.
+
+    Returns a list of human readable problems. An empty list means the
+    candidate may be published. Checks cover unknown path convertors,
+    duplicated path parameters, circular mounts and duplicate route names
+    within a single naming scope.
+    """
+    errors: list[str] = []
+    names: dict[str, BaseRoute] = {}
+    for route in routes:
+        if not isinstance(route, BaseRoute):
+            errors.append(f"Invalid route {route!r}: expected an instance of BaseRoute.")
+            continue
+        try:
+            if isinstance(route, (Route, WebSocketRoute)):
+                compile_path(route.path)
+            elif isinstance(route, Mount):
+                compile_path(route.path + "/{path:path}")
+            elif isinstance(route, Host):
+                compile_path(route.host)
+        except (AssertionError, ValueError, re.error) as exc:
+            errors.append(f"Invalid route {route!r}: {exc}")
+        name = getattr(route, "name", None)
+        if name is not None:
+            if name in names:
+                errors.append(f"Duplicate route name {name!r} for {route!r} and {names[name]!r}.")
+            else:
+                names[name] = route
+        mounted = _mounted_router(route)
+        if mounted is not None:
+            if id(mounted) in _seen:
+                errors.append(f"Circular mount detected at {route!r}.")
+            else:
+                errors.extend(_validate_routes(mounted.routes, (*_seen, id(mounted))))
+    return errors
+
+
+class RouteTable:
+    """
+    An immutable, versioned snapshot of a router's routes.
+
+    A route table is published atomically with `Router.publish(routes)`.
+    Requests that enter the router afterwards use the new table, while
+    requests that already entered keep using the table that was current when
+    they arrived. Matching, trailing-slash redirects and `request.url_for()`
+    within a single request always come from the same version, including
+    across nested `Mount` and `Host` routes.
+    """
+
+    def __init__(
+        self,
+        routes: Sequence[BaseRoute],
+        *,
+        version: int,
+        redirect_slashes: bool,
+        default: ASGIApp,
+        children: dict[int, RouteTable] | None = None,
+    ) -> None:
+        self.version = version
+        self.routes = tuple(routes)
+        self.redirect_slashes = redirect_slashes
+        self.default = default
+        self._children = {} if children is None else children
+
+    def child_for(self, router: Router) -> RouteTable | None:
+        return self._children.get(id(router))
+
+    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+        for route in self.routes:
+            try:
+                return route.url_path_for(name, **path_params)
+            except NoMatchFound:
+                pass
+        raise NoMatchFound(name, path_params)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        assert scope["type"] in ("http", "websocket")
+
+        partial = None
+
+        for route in self.routes:
+            # Determine if any route matches the incoming scope,
+            # and hand over to the matching route if found.
+            match, child_scope = route.matches(scope)
+            if match == Match.FULL:
+                scope.update(child_scope)
+                await route.handle(scope, receive, send)
+                return
+            elif match == Match.PARTIAL and partial is None:
+                partial = route
+                partial_scope = child_scope
+
+        if partial is not None:
+            #  Handle partial matches. These are cases where an endpoint is
+            # able to handle the request, but is not a preferred option.
+            # We use this in particular to deal with "405 Method Not Allowed".
+            scope.update(partial_scope)
+            await partial.handle(scope, receive, send)
+            return
+
+        route_path = get_route_path(scope)
+        if scope["type"] == "http" and self.redirect_slashes and route_path != "/":
+            redirect_scope = dict(scope)
+            if route_path.endswith("/"):
+                redirect_scope["path"] = redirect_scope["path"].rstrip("/")
+            else:
+                redirect_scope["path"] = redirect_scope["path"] + "/"
+
+            for route in self.routes:
+                match, child_scope = route.matches(redirect_scope)
+                if match != Match.NONE:
+                    redirect_url = URL(scope=redirect_scope)
+                    response = RedirectResponse(url=str(redirect_url))
+                    await response(scope, receive, send)
+                    return
+
+        await self.default(scope, receive, send)
+
+
 _T = TypeVar("_T")
 
 
@@ -639,6 +807,118 @@ class Router:
             for cls, args, kwargs in reversed(middleware):
                 self.middleware_stack = cls(self.middleware_stack, *args, **kwargs)
 
+        self._publish_lock = threading.Lock()
+        self._publish_history: list[PublishRecord] = []
+        self._rollback_log: list[RollbackRecord] = []
+        self._route_table = self._make_table(self.routes, version=1)
+
+    def _make_table(
+        self,
+        routes: Sequence[BaseRoute],
+        version: int,
+        _seen: tuple[int, ...] = (),
+        _children: dict[int, RouteTable] | None = None,
+    ) -> RouteTable:
+        """
+        Build an immutable snapshot of `routes`, recursively freezing any
+        mounted routers so that a published version cannot be changed by
+        later mutations of the caller's route lists.
+        """
+        if id(self) in _seen:
+            raise RouteTableError([f"Circular mount detected involving {self!r}."])
+        if _children is None:
+            _children = {}
+        seen = (*_seen, id(self))
+        frozen = tuple(self._freeze_route(route, version, seen, _children) for route in routes)
+        return RouteTable(
+            frozen,
+            version=version,
+            redirect_slashes=self.redirect_slashes,
+            default=self.default,
+            children=_children,
+        )
+
+    def _freeze_route(
+        self,
+        route: BaseRoute,
+        version: int,
+        seen: tuple[int, ...],
+        children: dict[int, RouteTable],
+    ) -> BaseRoute:
+        mounted = _mounted_router(route)
+        if mounted is None:
+            return route
+        child = mounted._make_table(mounted.routes, version, seen, children)
+        frozen = copy.copy(route)
+        if isinstance(route, Mount):
+            frozen._base_app = child
+            if route.app is route._base_app:
+                frozen.app = child
+            else:
+                # The mount is wrapped in middleware, so the mounted router is
+                # still called directly. Register the frozen child table so
+                # that the router resolves to this version when it is entered.
+                children[id(mounted)] = child
+        else:  # Host
+            frozen.app = child
+        return frozen
+
+    def _swap_routes(self, routes: Sequence[BaseRoute]) -> RouteTable:
+        with self._publish_lock:
+            table = self._make_table(list(routes), self._route_table.version + 1)
+            self._route_table = table
+            self.routes = list(routes)
+            return table
+
+    def publish(self, routes: Sequence[BaseRoute]) -> RouteTable:
+        """
+        Validate and atomically publish a whole new route table.
+
+        The candidate table is validated first. If validation fails a
+        `RouteTableError` is raised, the previously published table and its
+        version number remain in effect, and the rollback is recorded in
+        `.rollback_log`. On success the new table is swapped in atomically:
+        requests entering afterwards use the new version, while requests that
+        already entered keep using the version they started with. The caller's
+        `routes` list is copied, so later mutations of it cannot change the
+        published version.
+        """
+        candidate = list(routes)
+        try:
+            errors = _validate_routes(candidate, _seen=(id(self),))
+            if errors:
+                raise RouteTableError(errors)
+            with self._publish_lock:
+                table = self._make_table(candidate, self._route_table.version + 1)
+                self._route_table = table
+                self.routes = candidate
+                self._publish_history.append(PublishRecord(version=table.version, route_count=len(candidate)))
+                return table
+        except RouteTableError as exc:
+            with self._publish_lock:
+                self._rollback_log.append(RollbackRecord(version=self._route_table.version, errors=tuple(exc.errors)))
+            raise
+
+    @property
+    def route_table(self) -> RouteTable:
+        """The currently published route table."""
+        return self._route_table
+
+    @property
+    def route_table_version(self) -> int:
+        """The version number of the currently published route table."""
+        return self._route_table.version
+
+    @property
+    def publish_history(self) -> list[PublishRecord]:
+        """Successful publishes, in the order they were serialized."""
+        return list(self._publish_history)
+
+    @property
+    def rollback_log(self) -> list[RollbackRecord]:
+        """Failed publishes, recorded separately as rollback evidence."""
+        return list(self._rollback_log)
+
     async def not_found(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":
             websocket_close = WebSocketClose()
@@ -655,12 +935,7 @@ class Router:
         await response(scope, receive, send)
 
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
-        for route in self.routes:
-            try:
-                return route.url_path_for(name, **path_params)
-            except NoMatchFound:
-                pass
-        raise NoMatchFound(name, path_params)
+        return self._route_table.url_path_for(name, **path_params)
 
     async def startup(self) -> None:
         """
@@ -725,56 +1000,31 @@ class Router:
             await self.lifespan(scope, receive, send)
             return
 
-        partial = None
-
-        for route in self.routes:
-            # Determine if any route matches the incoming scope,
-            # and hand over to the matching route if found.
-            match, child_scope = route.matches(scope)
-            if match == Match.FULL:
-                scope.update(child_scope)
-                await route.handle(scope, receive, send)
-                return
-            elif match == Match.PARTIAL and partial is None:
-                partial = route
-                partial_scope = child_scope
-
-        if partial is not None:
-            #  Handle partial matches. These are cases where an endpoint is
-            # able to handle the request, but is not a preferred option.
-            # We use this in particular to deal with "405 Method Not Allowed".
-            scope.update(partial_scope)
-            await partial.handle(scope, receive, send)
-            return
-
-        route_path = get_route_path(scope)
-        if scope["type"] == "http" and self.redirect_slashes and route_path != "/":
-            redirect_scope = dict(scope)
-            if route_path.endswith("/"):
-                redirect_scope["path"] = redirect_scope["path"].rstrip("/")
-            else:
-                redirect_scope["path"] = redirect_scope["path"] + "/"
-
-            for route in self.routes:
-                match, child_scope = route.matches(redirect_scope)
-                if match != Match.NONE:
-                    redirect_url = URL(scope=redirect_scope)
-                    response = RedirectResponse(url=str(redirect_url))
-                    await response(scope, receive, send)
-                    return
-
-        await self.default(scope, receive, send)
+        table = scope.get("route_table")
+        if table is None:
+            # Pin this request to the route table version that is current
+            # right now. Matching, redirects and url_for() for this request
+            # will all come from this version, even if a new table is
+            # published while the request is in flight.
+            table = self._route_table
+            scope["route_table"] = table
+        else:
+            # A router mounted inside an already routed request (for example
+            # through a middleware-wrapped Mount) resolves to the frozen
+            # child table of the pinned version, if it was part of it.
+            table = table.child_for(self) or self._route_table
+        await table(scope, receive, send)
 
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, Router) and self.routes == other.routes
 
     def mount(self, path: str, app: ASGIApp, name: str | None = None) -> None:  # pragma: no cover
         route = Mount(path, app=app, name=name)
-        self.routes.append(route)
+        self._swap_routes([*self.routes, route])
 
     def host(self, host: str, app: ASGIApp, name: str | None = None) -> None:  # pragma: no cover
         route = Host(host, app=app, name=name)
-        self.routes.append(route)
+        self._swap_routes([*self.routes, route])
 
     def add_route(
         self,
@@ -791,7 +1041,7 @@ class Router:
             name=name,
             include_in_schema=include_in_schema,
         )
-        self.routes.append(route)
+        self._swap_routes([*self.routes, route])
 
     def add_websocket_route(
         self,
@@ -800,7 +1050,7 @@ class Router:
         name: str | None = None,
     ) -> None:  # pragma: no cover
         route = WebSocketRoute(path, endpoint=endpoint, name=name)
-        self.routes.append(route)
+        self._swap_routes([*self.routes, route])
 
     def route(
         self,

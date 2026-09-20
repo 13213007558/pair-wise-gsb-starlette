@@ -293,6 +293,48 @@ app = Router(routes=[
 ])
 ```
 
+## Publishing route tables
+
+Applications that are managed by a control plane can replace their whole
+route table at runtime, without restarting, by publishing a new table:
+
+```python
+app = Starlette(routes=initial_routes)
+
+# Later, from the control plane...
+app.publish_routes(new_routes)
+```
+
+Publishing is explicit and all-or-nothing:
+
+* The candidate table is validated first. Unknown path convertors, circular
+  mounts, and duplicate route names within a single naming scope are reported
+  by raising `RouteTableError`, and nothing is changed.
+* On success the new table is swapped in atomically. Requests that enter
+  afterwards use the new version, while requests that are already in flight
+  keep using the version they entered with, including for trailing-slash
+  redirects and `request.url_for()`.
+* The `routes` list is copied, and any mounted routers are frozen into the
+  published snapshot, so later mutations of the caller's lists cannot change
+  a published version.
+
+Each published table is an immutable `RouteTable` with a monotonically
+increasing `version`. Successful publishes are recorded in
+`router.publish_history`, and failed publishes are recorded separately in
+`router.rollback_log`, keeping the evidence that the previous table and its
+version number remained in effect.
+
+```python
+table = app.publish_routes(new_routes)
+assert app.route_table is table
+print(table.version)            # The new version number.
+print(router.publish_history)   # [PublishRecord(version=..., route_count=...)]
+print(router.rollback_log)      # [RollbackRecord(version=..., errors=(...))]
+```
+
+Publishing does not serialize in-flight requests: the swap is a single
+atomic reference change, so old and new requests are served concurrently.
+
 ## WebSocket Routing
 
 When working with WebSocket endpoints, you should use `WebSocketRoute`

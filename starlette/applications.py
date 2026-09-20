@@ -17,7 +17,7 @@ from starlette.middleware.errors import ServerErrorMiddleware
 from starlette.middleware.exceptions import ExceptionMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.routing import BaseRoute, Router
+from starlette.routing import BaseRoute, Router, RouteTable
 from starlette.types import ASGIApp, ExceptionHandler, Lifespan, Receive, Scope, Send
 from starlette.websockets import WebSocket
 
@@ -102,6 +102,24 @@ class Starlette:
     @property
     def routes(self) -> list[BaseRoute]:
         return self.router.routes
+
+    @property
+    def route_table(self) -> RouteTable:
+        """The currently published route table."""
+        return self.router.route_table
+
+    def publish_routes(self, routes: Sequence[BaseRoute]) -> RouteTable:
+        """
+        Validate and atomically publish a whole new route table, replacing the
+        current one without restarting the application.
+
+        The candidate table is validated first. If validation fails a
+        `RouteTableError` is raised and the previously published table and
+        its version number remain in effect. On success, requests entering
+        afterwards use the new version, while requests already in flight keep
+        using the version they started with.
+        """
+        return self.router.publish(routes)
 
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
         return self.router.url_path_for(name, **path_params)
