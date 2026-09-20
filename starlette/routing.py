@@ -4,6 +4,7 @@ import contextlib
 import functools
 import inspect
 import re
+import threading
 import traceback
 import types
 import warnings
@@ -35,6 +36,14 @@ class NoMatchFound(Exception):
     def __init__(self, name: str, path_params: dict[str, Any]) -> None:
         params = ", ".join(list(path_params.keys()))
         super().__init__(f'No route exists for name "{name}" and params "{params}".')
+
+
+class RouteTableError(ValueError):
+    """
+    Raised by `Router.publish_routes()` when a candidate route table fails
+    validation. The publish is aborted atomically: the previously published
+    table and its version number are left untouched.
+    """
 
 
 class Match(Enum):
@@ -577,6 +586,119 @@ class _DefaultLifespan:
         return self
 
 
+class RouteTable:
+    """
+    An immutable, versioned snapshot of a router's routes.
+
+    A route table is the unit of atomic publication: `Router.publish_routes()`
+    validates a candidate table and swaps it in as a whole, so any request that
+    is already being routed keeps using the table version it entered with,
+    while new requests observe the newly published version.
+
+    The snapshot holds its own copy of the routes, so mutating the list that
+    was passed to `publish_routes()` afterwards cannot alter the published
+    version.
+    """
+
+    __slots__ = ("routes", "version")
+
+    def __init__(self, routes: Sequence[BaseRoute], version: int) -> None:
+        self.routes = tuple(routes)
+        self.version = version
+
+    def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
+        for route in self.routes:
+            try:
+                return route.url_path_for(name, **path_params)
+            except NoMatchFound:
+                pass
+        raise NoMatchFound(name, path_params)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, RouteTable) and self.routes == other.routes and self.version == other.version
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(version={self.version}, routes={list(self.routes)!r})"
+
+
+def _check_name_conflicts(
+    routes: Sequence[BaseRoute], seen: dict[tuple[str, frozenset[str]], str], namespace: str
+) -> None:
+    for route in routes:
+        if isinstance(route, (Mount, Host)):
+            if route.name is not None:
+                # A named Mount/Host introduces its own namespace, addressed
+                # as "<name>:<child_name>". Names inside it cannot conflict
+                # with names outside of it.
+                _check_name_conflicts(route.routes, {}, namespace=f"{namespace}{route.name}:")
+            else:
+                # An unnamed Mount/Host merges its children into the
+                # surrounding namespace.
+                _check_name_conflicts(route.routes, seen, namespace)
+        elif isinstance(route, (Route, WebSocketRoute)):
+            # Two leaf routes in the same namespace that share a name and the
+            # same set of path parameters but have different paths cannot both
+            # be reversed correctly (the first one always wins), which is an
+            # unacceptable name conflict for publication. Routes sharing a
+            # name with distinct parameters are unambiguous, as `url_for()`
+            # selects them by the given keyword arguments.
+            key = (route.name, frozenset(route.param_convertors))
+            existing = seen.get(key)
+            if existing is not None and existing != route.path_format:
+                raise RouteTableError(
+                    f'Conflicting route name "{namespace}{route.name}": routes with the same name and path '
+                    "parameters but different paths cannot be published, as `url_for()` would be ambiguous."
+                )
+            seen[key] = route.path_format
+
+
+def _check_route_cycles(routes: Sequence[BaseRoute], active: set[int]) -> None:
+    for route in routes:
+        if isinstance(route, (Mount, Host)):
+            if id(route) in active:
+                raise RouteTableError(
+                    f"Circular mount detected: {route!r} contains itself, either directly or transitively."
+                )
+            active.add(id(route))
+            _check_route_cycles(route.routes, active)
+            active.discard(id(route))
+
+
+def _check_route_paths(routes: Sequence[BaseRoute], seen: set[int]) -> None:
+    for route in routes:
+        if id(route) in seen:
+            continue
+        seen.add(id(route))
+        try:
+            if isinstance(route, (Route, WebSocketRoute)):
+                compile_path(route.path)
+            elif isinstance(route, Mount):
+                compile_path(route.path + "/{path:path}")
+            elif isinstance(route, Host):
+                compile_path(route.host)
+        except (AssertionError, ValueError) as exc:
+            raise RouteTableError(f"Invalid route path for {route!r}: {exc}") from exc
+        if isinstance(route, (Mount, Host)):
+            _check_route_paths(route.routes, seen)
+
+
+def validate_route_table(routes: Sequence[BaseRoute]) -> None:
+    """
+    Validate a candidate route table prior to publication.
+
+    Raises `RouteTableError` if any entry is not a route, if a path or host
+    uses an unknown convertor or duplicated parameter names, if mounts or
+    hosts form a cycle, or if routes within the same namespace have
+    unacceptable name conflicts. Raises nothing if the table is publishable.
+    """
+    for route in routes:
+        if not isinstance(route, BaseRoute):
+            raise RouteTableError(f"Expected a route instance, got {route!r}.")
+    _check_route_cycles(routes, set())
+    _check_route_paths(routes, set())
+    _check_name_conflicts(routes, {}, "")
+
+
 class Router:
     def __init__(
         self,
@@ -591,7 +713,14 @@ class Router:
         *,
         middleware: Sequence[Middleware] | None = None,
     ) -> None:
-        self.routes = [] if routes is None else list(routes)
+        # The currently published route table. Requests pin the table version
+        # that is current when they enter the router, so an in-flight request
+        # keeps matching, redirecting and reversing URLs against one version
+        # even if a new table is published concurrently.
+        self._route_table = RouteTable([] if routes is None else list(routes), version=0)
+        # Serializes concurrent publications. Request handling never takes
+        # this lock, so publishing never serializes in-flight requests.
+        self._publish_lock = threading.Lock()
         self.redirect_slashes = redirect_slashes
         self.default = self.not_found if default is None else default
         self.on_startup = [] if on_startup is None else list(on_startup)
@@ -639,6 +768,46 @@ class Router:
             for cls, args, kwargs in reversed(middleware):
                 self.middleware_stack = cls(self.middleware_stack, *args, **kwargs)
 
+    @property
+    def routes(self) -> list[BaseRoute]:
+        return list(self._route_table.routes)
+
+    @routes.setter
+    def routes(self, routes: Sequence[BaseRoute]) -> None:
+        # Replacing the routes outside of `publish_routes()` is treated as an
+        # unvalidated, copy-on-write update, preserving the historical
+        # behavior of mutating `router.routes` directly.
+        with self._publish_lock:
+            self._route_table = RouteTable(list(routes), version=self._route_table.version + 1)
+
+    @property
+    def route_table(self) -> RouteTable:
+        """The currently published route table snapshot."""
+        return self._route_table
+
+    def publish_routes(self, routes: Sequence[BaseRoute]) -> RouteTable:
+        """
+        Validate and atomically publish a new route table.
+
+        The candidate table is fully validated first. If validation fails a
+        `RouteTableError` is raised and the previously published table and
+        its version number are left untouched. On success the new table is
+        swapped in as a whole: requests that enter the router afterwards use
+        the new version, while requests already in flight keep the version
+        they entered with.
+
+        The candidate routes are copied, so later mutations of the list
+        passed in cannot alter the published version. Concurrent calls are
+        serialized and each successful call publishes a strictly increasing
+        version number.
+        """
+        candidate = list(routes)
+        with self._publish_lock:
+            validate_route_table(candidate)
+            table = RouteTable(candidate, version=self._route_table.version + 1)
+            self._route_table = table
+        return table
+
     async def not_found(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "websocket":
             websocket_close = WebSocketClose()
@@ -655,12 +824,7 @@ class Router:
         await response(scope, receive, send)
 
     def url_path_for(self, name: str, /, **path_params: Any) -> URLPath:
-        for route in self.routes:
-            try:
-                return route.url_path_for(name, **path_params)
-            except NoMatchFound:
-                pass
-        raise NoMatchFound(name, path_params)
+        return self._route_table.url_path_for(name, **path_params)
 
     async def startup(self) -> None:
         """
@@ -725,9 +889,18 @@ class Router:
             await self.lifespan(scope, receive, send)
             return
 
+        # Pin the route table version for this request. Matching, trailing
+        # slash redirects and `url_for()` within a single request all use
+        # the version that was current when the request entered, even if a
+        # new table is published while the request is in flight. The
+        # outermost router's table governs `url_for()` for the request.
+        route_table = self._route_table
+        scope.setdefault("route_table", route_table)
+        routes = route_table.routes
+
         partial = None
 
-        for route in self.routes:
+        for route in routes:
             # Determine if any route matches the incoming scope,
             # and hand over to the matching route if found.
             match, child_scope = route.matches(scope)
@@ -755,7 +928,7 @@ class Router:
             else:
                 redirect_scope["path"] = redirect_scope["path"] + "/"
 
-            for route in self.routes:
+            for route in routes:
                 match, child_scope = route.matches(redirect_scope)
                 if match != Match.NONE:
                     redirect_url = URL(scope=redirect_scope)
@@ -770,11 +943,11 @@ class Router:
 
     def mount(self, path: str, app: ASGIApp, name: str | None = None) -> None:  # pragma: no cover
         route = Mount(path, app=app, name=name)
-        self.routes.append(route)
+        self.routes = [*self.routes, route]
 
     def host(self, host: str, app: ASGIApp, name: str | None = None) -> None:  # pragma: no cover
         route = Host(host, app=app, name=name)
-        self.routes.append(route)
+        self.routes = [*self.routes, route]
 
     def add_route(
         self,
@@ -791,7 +964,7 @@ class Router:
             name=name,
             include_in_schema=include_in_schema,
         )
-        self.routes.append(route)
+        self.routes = [*self.routes, route]
 
     def add_websocket_route(
         self,
@@ -800,7 +973,7 @@ class Router:
         name: str | None = None,
     ) -> None:  # pragma: no cover
         route = WebSocketRoute(path, endpoint=endpoint, name=name)
-        self.routes.append(route)
+        self.routes = [*self.routes, route]
 
     def route(
         self,

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from python_multipart.multipart import parse_options_header
 
     from starlette.applications import Starlette
-    from starlette.routing import Router
+    from starlette.routing import Router, RouteTable
 else:
     try:
         try:
@@ -181,7 +181,13 @@ class HTTPConnection(Mapping[str, Any]):
         return self._state
 
     def url_for(self, name: str, /, **path_params: Any) -> URL:
-        url_path_provider: Router | Starlette | None = self.scope.get("router") or self.scope.get("app")
+        # The route table pinned when the request entered the router takes
+        # precedence, so that `url_for()` resolves against the same route
+        # table version that matched this request, even if a new table has
+        # been published while the request is in flight.
+        url_path_provider: RouteTable | Router | Starlette | None = (
+            self.scope.get("route_table") or self.scope.get("router") or self.scope.get("app")
+        )
         if url_path_provider is None:
             raise RuntimeError("The `url_for` method can only be used inside a Starlette application or with a router.")
         url_path = url_path_provider.url_path_for(name, **path_params)

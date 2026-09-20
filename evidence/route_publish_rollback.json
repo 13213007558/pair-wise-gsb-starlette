@@ -1,0 +1,25 @@
+{
+  "failures": [
+    {
+      "case": "unknown_convertor",
+      "version": 0
+    },
+    {
+      "case": "circular_mount",
+      "version": 0
+    },
+    {
+      "case": "name_conflict",
+      "version": 0
+    },
+    {
+      "case": "not_a_route",
+      "version": 0
+    }
+  ],
+  "old_route_still_served": true,
+  "table_preserved": true,
+  "test": "test_failed_publish_keeps_old_table_and_version",
+  "version_after": 0,
+  "version_before": 0
+}

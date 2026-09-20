@@ -293,6 +293,39 @@ app = Router(routes=[
 ])
 ```
 
+## Publishing route tables
+
+Applications that manage their routing dynamically — for example when a
+control plane pushes route configuration — can replace the whole route
+table atomically, without restarting the application:
+
+```python
+table = app.publish_routes([
+    Route('/users', users, name='users'),
+    Mount('/admin', routes=[Route('/', dashboard, name='dashboard')], name='admin'),
+])
+print(table.version)  # 1
+```
+
+The candidate table is fully validated before anything changes. A
+`RouteTableError` is raised — and the previously published table and its
+version number are kept — if any route uses an unknown path convertor or
+duplicated parameter names, if mounts or hosts form a cycle, or if routes
+within the same namespace share a name and parameters but map to different
+paths, which would make `url_for()` ambiguous.
+
+Once published, requests entering the application use the new table version,
+while requests already in flight keep the version they entered with. Within
+a single request, path matching, trailing-slash redirects and
+`request.url_for()` — including across nested `Mount` and `Host` routes and
+WebSockets — always come from that same pinned version. Publishing never
+blocks in-flight requests, and the published snapshot is isolated from
+later mutations of the list that was passed in.
+
+The currently published table is available as `app.route_table`, and
+`Router.publish_routes()` provides the same behavior for plain `Router`
+instances.
+
 ## WebSocket Routing
 
 When working with WebSocket endpoints, you should use `WebSocketRoute`

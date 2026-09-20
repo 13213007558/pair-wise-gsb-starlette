@@ -1,0 +1,14 @@
+{"case": "publish", "from_version": 0, "to_version": 1}
+{"case": "url", "round": 1, "status": 200, "url": "http://testserver/users", "version": 0}
+{"case": "404", "round": 1, "status": 404, "version": 0}
+{"allow": "POST", "case": "405", "round": 1, "status": 405, "version": 0}
+{"case": "ws", "round": 1, "url": "ws://testserver/ws", "version": 0}
+{"case": "url", "round": 2, "status": 200, "url": "http://testserver/v2/users", "version": 1}
+{"case": "404", "round": 2, "status": 404, "version": 1}
+{"case": "405", "round": 2, "status": 200, "version": 1}
+{"case": "ws", "round": 2, "url": "ws://testserver/v2/ws", "version": 1}
+{"case": "concurrent_publish", "order": 0, "version": 1, "worker": 4}
+{"case": "concurrent_publish", "order": 1, "version": 2, "worker": 0}
+{"case": "concurrent_publish", "order": 2, "version": 3, "worker": 1}
+{"case": "concurrent_publish", "order": 3, "version": 4, "worker": 2}
+{"case": "concurrent_publish", "order": 4, "version": 5, "worker": 3}
