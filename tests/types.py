@@ -20,6 +20,7 @@ if TYPE_CHECKING:
             headers: dict[str, str] | None = None,
             follow_redirects: bool = True,
             client: tuple[str, int] = ("testclient", 50000),
+            app_call_timeout: float | None = None,
         ) -> TestClient: ...
 else:  # pragma: no cover
 

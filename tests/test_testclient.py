@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import itertools
 import sys
+import threading
+import time
 from asyncio import Task, current_task as asyncio_current_task
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -17,8 +19,8 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
-from starlette.routing import Route
-from starlette.testclient import ASGIInstance, TestClient
+from starlette.routing import Route, WebSocketRoute
+from starlette.testclient import AppCallTimeoutError, ASGIInstance, TestClient
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from tests.types import TestClientFactory
@@ -428,3 +430,335 @@ def test_timeout_deprecation() -> None:
     with pytest.deprecated_call(match="You should not use the 'timeout' argument with the TestClient."):
         client = TestClient(mock_service)
         client.get("/", timeout=1)
+
+
+def test_app_call_timeout_reclaims_hanging_http_call(test_client_factory: TestClientFactory) -> None:
+    """A hanging HTTP call raises AppCallTimeoutError and its app work is cancelled."""
+    hang_cancelled = threading.Event()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["path"] == "/hang":
+            try:
+                await anyio.sleep_forever()
+            except anyio.get_cancelled_exc_class():
+                hang_cancelled.set()
+                raise
+        else:
+            response = JSONResponse({"ok": True})
+            await response(scope, receive, send)
+
+    client = test_client_factory(app)
+    with pytest.raises(AppCallTimeoutError, match="did not complete within"):
+        client.get("/hang", extensions={"app_call_timeout": 0.2})
+    # The app coroutine created by the timed-out call has been reclaimed.
+    assert hang_cancelled.wait(5)
+    # The client is still usable for subsequent calls.
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
+def test_app_call_timeout_client_level_default(test_client_factory: TestClientFactory) -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await anyio.sleep_forever()
+
+    client = test_client_factory(app, app_call_timeout=0.2)
+    with pytest.raises(AppCallTimeoutError):
+        client.get("/")
+
+
+def test_app_call_timeout_concurrent_http_isolation(test_client_factory: TestClientFactory) -> None:
+    """A timed-out call must not affect another concurrent call on the same client."""
+    barrier = threading.Barrier(2)
+    hang_cancelled = threading.Event()
+
+    async def hang_endpoint(request: Request) -> JSONResponse:
+        # Both endpoints rendezvous here, so the two calls are provably
+        # in-flight at the same time on the shared portal.
+        await anyio.to_thread.run_sync(barrier.wait, 10)
+        try:
+            await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class():
+            hang_cancelled.set()
+            raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def ok_endpoint(request: Request) -> JSONResponse:
+        await anyio.to_thread.run_sync(barrier.wait, 10)
+        return JSONResponse({"ok": True})
+
+    app = Starlette(routes=[Route("/hang", hang_endpoint), Route("/ok", ok_endpoint)])
+
+    client = test_client_factory(app)
+    results: dict[str, Any] = {}
+
+    def call_hang() -> None:
+        try:
+            client.get("/hang", extensions={"app_call_timeout": 0.2})
+        except AppCallTimeoutError as exc:
+            results["hang"] = exc
+
+    def call_ok() -> None:
+        results["ok"] = client.get("/ok").status_code
+
+    with client:
+        hang_thread = threading.Thread(target=call_hang)
+        ok_thread = threading.Thread(target=call_ok)
+        hang_thread.start()
+        ok_thread.start()
+        hang_thread.join(10)
+        ok_thread.join(10)
+
+    assert isinstance(results["hang"], AppCallTimeoutError)
+    assert results["ok"] == 200
+    assert hang_cancelled.wait(5)
+
+
+def test_app_call_timeout_websocket_handshake(test_client_factory: TestClientFactory) -> None:
+    """A WebSocket handshake that is never accepted times out and is reclaimed."""
+    app_cancelled = threading.Event()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await receive()
+            await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class():
+            app_cancelled.set()
+            raise
+
+    client = test_client_factory(app)
+    with pytest.raises(AppCallTimeoutError, match="WebSocket handshake did not complete"):
+        with client.websocket_connect("/", extensions={"app_call_timeout": 0.2}):
+            pass  # pragma: no cover
+    # The app task behind the failed handshake has been cancelled.
+    assert app_cancelled.wait(5)
+
+
+def test_app_call_timeout_concurrent_websocket_isolation(test_client_factory: TestClientFactory) -> None:
+    """A timed-out WebSocket handshake must not affect a concurrent one."""
+    barrier = threading.Barrier(2)
+    hang_cancelled = threading.Event()
+
+    async def hang_endpoint(websocket: WebSocket) -> None:
+        await anyio.to_thread.run_sync(barrier.wait, 10)
+        try:
+            await anyio.sleep_forever()
+        except anyio.get_cancelled_exc_class():
+            hang_cancelled.set()
+            raise
+
+    async def ok_endpoint(websocket: WebSocket) -> None:
+        await anyio.to_thread.run_sync(barrier.wait, 10)
+        await websocket.accept()
+        message = await websocket.receive_text()
+        await websocket.send_text(message)
+        await websocket.close()
+
+    app = Starlette(routes=[WebSocketRoute("/hang", hang_endpoint), WebSocketRoute("/ok", ok_endpoint)])
+
+    client = test_client_factory(app)
+    results: dict[str, Any] = {}
+
+    def connect_hang() -> None:
+        try:
+            with client.websocket_connect("/hang", extensions={"app_call_timeout": 0.2}):
+                pass  # pragma: no cover
+        except AppCallTimeoutError as exc:
+            results["hang"] = exc
+
+    def connect_ok() -> None:
+        with client.websocket_connect("/ok") as websocket:
+            websocket.send_text("ping")
+            results["ok"] = websocket.receive_text()
+
+    with client:
+        hang_thread = threading.Thread(target=connect_hang)
+        ok_thread = threading.Thread(target=connect_ok)
+        hang_thread.start()
+        ok_thread.start()
+        hang_thread.join(10)
+        ok_thread.join(10)
+
+    assert isinstance(results["hang"], AppCallTimeoutError)
+    assert results["ok"] == "ping"
+    assert hang_cancelled.wait(5)
+
+
+def test_websocket_handshake_timeout_is_not_session_lifetime(test_client_factory: TestClientFactory) -> None:
+    """The handshake deadline must not silently become the connection's lifetime."""
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        websocket = WebSocket(scope, receive=receive, send=send)
+        await websocket.accept()
+        # Outlive the handshake timeout before sending the first message.
+        await anyio.sleep(0.4)
+        await websocket.send_text("hello")
+        await websocket.close()
+
+    client = test_client_factory(app)
+    with client.websocket_connect("/", extensions={"app_call_timeout": 0.1}) as websocket:
+        assert websocket.receive_text() == "hello"
+
+
+def test_app_call_timeout_does_not_mask_business_exception(test_client_factory: TestClientFactory) -> None:
+    """Business exceptions must propagate as-is, never disguised as timeouts."""
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        raise ValueError("boom")
+
+    client = test_client_factory(app, app_call_timeout=10)
+    with pytest.raises(ValueError, match="boom"):
+        client.get("/")
+
+
+def test_app_call_timeout_with_sync_endpoint_in_thread(test_client_factory: TestClientFactory) -> None:
+    """
+    Sync code running in a worker thread cannot be force-killed: the caller
+    gets AppCallTimeoutError while the thread runs to completion in the
+    background, and the client stays usable.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_endpoint(request: Request) -> JSONResponse:
+        started.set()
+        release.wait(10)
+        finished.set()
+        return JSONResponse({"ok": True})
+
+    def quick_endpoint(request: Request) -> JSONResponse:
+        return JSONResponse({"ok": True})
+
+    app = Starlette(routes=[Route("/blocking", blocking_endpoint), Route("/quick", quick_endpoint)])
+    client = test_client_factory(app)
+    with client:
+        with pytest.raises(AppCallTimeoutError):
+            client.get("/blocking", extensions={"app_call_timeout": 0.2})
+        # The caller was notified while the sync code is still blocked:
+        # the worker thread cannot be killed and keeps running.
+        assert started.is_set()
+        assert not finished.is_set()
+        # Let the abandoned worker thread run to completion.
+        release.set()
+        assert finished.wait(10)
+        # The client and its thread pool remain usable.
+        assert client.get("/quick").status_code == 200
+
+
+def test_app_call_timeout_sync_endpoint_without_context_manager(test_client_factory: TestClientFactory) -> None:
+    """
+    Without the context manager, the per-call portal is released in the
+    background, so the caller gets AppCallTimeoutError promptly even when
+    the app is stuck in synchronous code that cannot be force-killed.
+    """
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_endpoint(request: Request) -> JSONResponse:
+        release.wait(10)
+        finished.set()
+        return JSONResponse({"ok": True})
+
+    app = Starlette(routes=[Route("/blocking", blocking_endpoint)])
+    client = test_client_factory(app)
+    start = time.monotonic()
+    with pytest.raises(AppCallTimeoutError):
+        client.get("/blocking", extensions={"app_call_timeout": 0.2})
+    # The caller was notified promptly, not after the stuck thread finished.
+    assert time.monotonic() - start < 5
+    assert not finished.is_set()
+    release.set()
+    assert finished.wait(10)
+
+
+def test_lifespan_shutdown_runs_once_on_repeated_close(test_client_factory: TestClientFactory) -> None:
+    shutdowns = 0
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+        nonlocal shutdowns
+        yield
+        shutdowns += 1
+
+    app = Starlette(lifespan=lifespan)
+    client = test_client_factory(app)
+    with client:
+        pass
+    client.__exit__()
+    client.__exit__()
+    assert shutdowns == 1
+
+
+def test_lifespan_shutdown_not_run_on_startup_failure(test_client_factory: TestClientFactory) -> None:
+    shutdowns = 0
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+        nonlocal shutdowns
+        raise RuntimeError("startup failure")
+        yield  # pragma: no cover
+        shutdowns += 1  # pragma: no cover
+
+    app = Starlette(lifespan=lifespan)
+    client = test_client_factory(app)
+    with pytest.raises(RuntimeError, match="startup failure"):
+        with client:
+            pass  # pragma: no cover
+    assert shutdowns == 0
+
+
+def test_lifespan_shutdown_once_after_timed_out_calls(test_client_factory: TestClientFactory) -> None:
+    """Cancellation of individual calls must not disturb the lifespan task."""
+    shutdowns = 0
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+        nonlocal shutdowns
+        yield
+        shutdowns += 1
+
+    async def hang(request: Request) -> JSONResponse:
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def ok(request: Request) -> JSONResponse:
+        return JSONResponse({"ok": True})
+
+    app = Starlette(
+        lifespan=lifespan,
+        routes=[Route("/hang", hang), Route("/ok", ok)],
+    )
+    client = test_client_factory(app)
+    with client:
+        with pytest.raises(AppCallTimeoutError):
+            client.get("/hang", extensions={"app_call_timeout": 0.2})
+        assert client.get("/ok").status_code == 200
+    assert shutdowns == 1
+
+
+def test_lifespan_shutdown_once_after_late_app_exception(test_client_factory: TestClientFactory) -> None:
+    """An exception raised after the response completed must not cause extra shutdowns."""
+    shutdowns = 0
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+        nonlocal shutdowns
+        yield
+        shutdowns += 1
+
+    lifespan_app = Starlette(lifespan=lifespan)
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            await lifespan_app(scope, receive, send)
+            return
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+        raise RuntimeError("late exception")
+
+    client = test_client_factory(app)
+    with client:
+        with pytest.raises(RuntimeError, match="late exception"):
+            client.get("/")
+    assert shutdowns == 1

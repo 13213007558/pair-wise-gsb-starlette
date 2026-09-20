@@ -113,6 +113,52 @@ def test_app()
        ...
 ```
 
+### Timing out application calls
+
+If an endpoint hangs, calls made with the `TestClient` wait forever by default.
+You can bound how long a single application call may run with `app_call_timeout`
+(in seconds):
+
+```python
+client = TestClient(app, app_call_timeout=5.0)
+```
+
+The default can be overridden per call through the `app_call_timeout` request
+extension. This works for both HTTP requests and WebSocket handshakes:
+
+```python
+response = client.get("/", extensions={"app_call_timeout": 1.0})
+
+with client.websocket_connect("/ws", extensions={"app_call_timeout": 1.0}) as websocket:
+    ...
+```
+
+Passing `extensions={"app_call_timeout": None}` disables the timeout for that call.
+
+When the deadline expires, `starlette.testclient.AppCallTimeoutError` (a
+`TimeoutError` subclass) is raised to the caller, and the application work
+created by that call is cancelled. The deadline is scoped to the individual
+call: the shared portal, the lifespan task and any other concurrent calls on
+the same client keep running. Exceptions raised by the application itself are
+never disguised as timeouts, and `AppCallTimeoutError` is raised even when
+`raise_server_exceptions=False`.
+
+For WebSockets, the deadline only covers the handshake, up to the connection
+being accepted or rejected. Once connected, the session is unbounded again.
+
+!!! note "Synchronous code in worker threads"
+    Python cannot force-kill a thread. If the application is executing
+    synchronous code in a worker thread when the deadline expires (for
+    example a sync endpoint), that thread keeps running in the background
+    until the function returns. The guaranteed boundaries are:
+
+    * The caller gets `AppCallTimeoutError` when the deadline expires.
+    * The asynchronous side of the call is cancelled, and other concurrent
+      calls on the same client are unaffected.
+    * If the client is used without the context manager, the per-call portal
+      is released in the background; its resources are freed once the
+      abandoned worker thread returns.
+
 ### Testing WebSocket sessions
 
 You can also test websocket sessions with the test client.

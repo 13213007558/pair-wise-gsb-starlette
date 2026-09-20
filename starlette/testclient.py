@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import inspect
 import io
 import json
 import math
 import sys
+import threading
+import time
 import warnings
 from collections.abc import Awaitable, Generator, Iterable, Mapping, MutableMapping, Sequence
 from concurrent.futures import Future
@@ -87,6 +90,17 @@ class _Upgrade(Exception):
         self.session = session
 
 
+class AppCallTimeoutError(TimeoutError):
+    """
+    Raised when an ASGI application call does not complete within the
+    ``app_call_timeout`` configured on the ``TestClient`` or overridden
+    on the individual request.
+
+    Only the timed-out call is cancelled. The shared portal, the lifespan
+    task and any other concurrent calls on the same client keep running.
+    """
+
+
 class WebSocketDenialResponse(  # type: ignore[misc]
     httpx.Response,
     WebSocketDisconnect,
@@ -103,12 +117,14 @@ class WebSocketTestSession:
         app: ASGI3App,
         scope: Scope,
         portal_factory: _PortalFactoryType,
+        app_call_timeout: float | None = None,
     ) -> None:
         self.app = app
         self.scope = scope
         self.accepted_subprotocol = None
         self.portal_factory = portal_factory
         self.extra_headers = None
+        self.app_call_timeout = app_call_timeout
 
     def __enter__(self) -> WebSocketTestSession:
         with contextlib.ExitStack() as stack:
@@ -117,8 +133,22 @@ class WebSocketTestSession:
             stack.callback(fut.result)
             stack.callback(portal.call, cs.cancel)
             self.send({"type": "websocket.connect"})
-            message = self.receive()
-            self._raise_on_close(message)
+            deadline = None
+            if self.app_call_timeout is not None:
+                deadline = time.monotonic() + self.app_call_timeout
+            try:
+                message = self._receive_with_deadline(deadline)
+            except AppCallTimeoutError:
+                # Cancel the timed-out handshake's app task, then run the
+                # remaining teardown in the background: the app may be
+                # stuck in a worker thread running synchronous code, which
+                # cannot be force-killed, and the caller must not be
+                # blocked waiting for it.
+                portal.call(cs.cancel)
+                teardown = stack.pop_all()
+                threading.Thread(target=teardown.close, daemon=True).start()
+                raise
+            self._raise_on_close(message, deadline)
             self.accepted_subprotocol = message.get("subprotocol", None)
             self.extra_headers = message.get("headers", None)
             stack.callback(self.close, 1000)
@@ -127,6 +157,28 @@ class WebSocketTestSession:
 
     def __exit__(self, *args: Any) -> bool | None:
         return self.exit_stack.__exit__(*args)
+
+    def _receive_with_deadline(self, deadline: float | None) -> Message:
+        """
+        Receive a message during the WebSocket handshake, bounded by an
+        absolute ``time.monotonic()`` deadline. Once the handshake has
+        completed, receives use the plain unbounded ``receive()`` again,
+        so the handshake timeout never limits the session lifetime.
+        """
+        if deadline is None:
+            return self.receive()
+        timeout = max(deadline - time.monotonic(), 0.0)
+
+        async def receive_with_timeout() -> Message:
+            message: Message | None = None
+            with anyio.move_on_after(timeout) as cancel_scope:
+                message = await self._send_rx.receive()
+            if cancel_scope.cancelled_caught:
+                raise AppCallTimeoutError(f"WebSocket handshake did not complete within {timeout} seconds.")
+            assert message is not None
+            return message
+
+        return self.portal.call(receive_with_timeout)
 
     async def _run(self, *, task_status: anyio.abc.TaskStatus[anyio.CancelScope]) -> None:
         """
@@ -145,7 +197,7 @@ class WebSocketTestSession:
             # wait for cs.cancel to be called before closing streams
             await anyio.sleep_forever()
 
-    def _raise_on_close(self, message: Message) -> None:
+    def _raise_on_close(self, message: Message, deadline: float | None = None) -> None:
         if message["type"] == "websocket.close":
             raise WebSocketDisconnect(code=message.get("code", 1000), reason=message.get("reason", ""))
         elif message["type"] == "websocket.http.response.start":
@@ -153,7 +205,7 @@ class WebSocketTestSession:
             headers: list[tuple[bytes, bytes]] = message["headers"]
             body: list[bytes] = []
             while True:
-                message = self.receive()
+                message = self._receive_with_deadline(deadline)
                 assert message["type"] == "websocket.http.response.body"
                 body.append(message["body"])
                 if not message.get("more_body", False):
@@ -212,6 +264,7 @@ class _TestClientTransport(httpx.BaseTransport):
         *,
         client: tuple[str, int],
         app_state: dict[str, Any],
+        app_call_timeout: float | None = None,
     ) -> None:
         self.app = app
         self.raise_server_exceptions = raise_server_exceptions
@@ -219,8 +272,28 @@ class _TestClientTransport(httpx.BaseTransport):
         self.portal_factory = portal_factory
         self.app_state = app_state
         self.client = client
+        self.app_call_timeout = app_call_timeout
+
+    async def _run_app(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        task_status: anyio.abc.TaskStatus[anyio.CancelScope],
+    ) -> None:
+        """
+        Run the ASGI app for a single request inside its own cancel scope,
+        so that an ``app_call_timeout`` deadline can cancel just this call
+        without affecting the shared portal or other concurrent calls.
+        """
+        with anyio.CancelScope() as cancel_scope:
+            task_status.started(cancel_scope)
+            await self.app(scope, receive, send)
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
+        app_call_timeout = cast("float | None", request.extensions.get("app_call_timeout", self.app_call_timeout))
+
         scheme = request.url.scheme
         netloc = request.url.netloc.decode(encoding="ascii")
         path = request.url.path
@@ -269,7 +342,7 @@ class _TestClientTransport(httpx.BaseTransport):
                 "state": self.app_state.copy(),
                 "extensions": {"websocket.http.response": {}},
             }
-            session = WebSocketTestSession(self.app, scope, self.portal_factory)
+            session = WebSocketTestSession(self.app, scope, self.portal_factory, app_call_timeout=app_call_timeout)
             raise _Upgrade(session)
 
         scope = {
@@ -345,13 +418,36 @@ class _TestClientTransport(httpx.BaseTransport):
                 template = message["info"]["template"]
                 context = message["info"]["context"]
 
+        portal_context = self.portal_factory()
+        portal = portal_context.__enter__()
+        close_portal_in_background = False
         try:
-            with self.portal_factory() as portal:
-                response_complete = portal.call(anyio.Event)
+            response_complete = portal.call(anyio.Event)
+            if app_call_timeout is None:
                 portal.call(self.app, scope, receive, send)
+            else:
+                future, cancel_scope = portal.start_task(self._run_app, scope, receive, send)
+                done, _not_done = concurrent.futures.wait([future], timeout=app_call_timeout)
+                if future not in done:
+                    # The deadline expired. Cancel only this call's scope;
+                    # the shared portal and any other concurrent calls
+                    # keep running.
+                    portal.call(cancel_scope.cancel)
+                    # The cancelled call may be stuck in a worker thread
+                    # that cannot be force-killed, so release the portal
+                    # in the background instead of blocking the caller
+                    # on its shutdown.
+                    close_portal_in_background = True
+                    raise AppCallTimeoutError(f"ASGI app did not complete within {app_call_timeout} seconds.")
+                future.result()
         except BaseException as exc:
-            if self.raise_server_exceptions:
+            if self.raise_server_exceptions or isinstance(exc, AppCallTimeoutError):
                 raise exc
+        finally:
+            if close_portal_in_background:
+                threading.Thread(target=portal_context.__exit__, args=(None, None, None), daemon=True).start()
+            else:
+                portal_context.__exit__(*sys.exc_info())
 
         if self.raise_server_exceptions:
             assert response_started, "TestClient did not receive any response."
@@ -388,6 +484,7 @@ class TestClient(httpx.Client):
         headers: dict[str, str] | None = None,
         follow_redirects: bool = True,
         client: tuple[str, int] = ("testclient", 50000),
+        app_call_timeout: float | None = None,
     ) -> None:
         self.async_backend = _AsyncBackend(backend=backend, backend_options=backend_options or {})
         if _is_asgi3(app):
@@ -404,6 +501,7 @@ class TestClient(httpx.Client):
             root_path=root_path,
             app_state=self.app_state,
             client=client,
+            app_call_timeout=app_call_timeout,
         )
         if headers is None:
             headers = {}
