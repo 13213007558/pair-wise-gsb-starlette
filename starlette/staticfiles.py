@@ -45,6 +45,7 @@ class StaticFiles:
         html: bool = False,
         check_dir: bool = True,
         follow_symlink: bool = False,
+        consistent_file_view: bool = False,
     ) -> None:
         self.directory = directory
         self.packages = packages
@@ -52,6 +53,7 @@ class StaticFiles:
         self.html = html
         self.config_checked = False
         self.follow_symlink = follow_symlink
+        self.consistent_file_view = consistent_file_view
         if check_dir and directory is not None and not os.path.isdir(directory):
             raise RuntimeError(f"Directory '{directory}' does not exist")
 
@@ -126,7 +128,8 @@ class StaticFiles:
 
         if stat_result and stat.S_ISREG(stat_result.st_mode):
             # We have a static file to serve.
-            return self.file_response(full_path, stat_result, scope)
+            response = self.file_response(full_path, stat_result, scope)
+            return await self._prepare_file_response(response, scope)
 
         elif stat_result and stat.S_ISDIR(stat_result.st_mode) and self.html:
             # We're in HTML mode, and have got a directory URL.
@@ -139,13 +142,20 @@ class StaticFiles:
                     url = URL(scope=scope)
                     url = url.replace(path=url.path + "/")
                     return RedirectResponse(url=url)
-                return self.file_response(full_path, stat_result, scope)
+                response = self.file_response(full_path, stat_result, scope)
+                return await self._prepare_file_response(response, scope)
 
         if self.html:
             # Check for '404.html' if we're in HTML mode.
             full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, "404.html")
             if stat_result and stat.S_ISREG(stat_result.st_mode):
-                return FileResponse(full_path, stat_result=stat_result, status_code=404)
+                response = FileResponse(
+                    full_path,
+                    stat_result=None if self.consistent_file_view else stat_result,
+                    status_code=404,
+                    consistent_file_view=self.consistent_file_view,
+                )
+                return await self._prepare_file_response(response, scope, check_not_modified=False)
         raise HTTPException(status_code=404)
 
     def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
@@ -172,11 +182,40 @@ class StaticFiles:
         stat_result: os.stat_result,
         scope: Scope,
         status_code: int = 200,
+    ) -> FileResponse:
+        response = FileResponse(
+            full_path,
+            status_code=status_code,
+            stat_result=None if self.consistent_file_view else stat_result,
+            consistent_file_view=self.consistent_file_view,
+        )
+        return response
+
+    async def _prepare_file_response(
+        self, response: FileResponse, scope: Scope, check_not_modified: bool = True
     ) -> Response:
         request_headers = Headers(scope=scope)
+        if not self.consistent_file_view or not isinstance(response, FileResponse):
+            if not check_not_modified:
+                return response
+            if self.is_not_modified(response.headers, request_headers):
+                return NotModifiedResponse(response.headers)
+            return response
 
-        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
-        if self.is_not_modified(response.headers, request_headers):
+        try:
+            await response.prepare()
+        except PermissionError:
+            await response.aclose()
+            raise HTTPException(status_code=401)
+        except (FileNotFoundError, IsADirectoryError, RuntimeError):
+            await response.aclose()
+            raise HTTPException(status_code=404)
+        except BaseException:
+            await response.aclose()
+            raise
+
+        if check_not_modified and self.is_not_modified(response.headers, request_headers):
+            await response.aclose()
             return NotModifiedResponse(response.headers)
         return response
 

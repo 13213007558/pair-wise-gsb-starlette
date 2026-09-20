@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sys
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
@@ -384,6 +385,213 @@ async def test_file_response_with_pathsend(tmpdir: Path) -> None:
         receive,
         send,
     )
+
+
+def _replace_file(path: Path, content: bytes) -> None:
+    replacement = path.with_name(path.name + ".replacement")
+    replacement.write_bytes(content)
+    os.replace(replacement, path)
+
+
+@pytest.mark.anyio
+async def test_file_response_consistent_file_view_remains_stable_across_rename(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    old_content = b"old content"
+    new_content = b"new replacement content"
+    path.write_bytes(old_content)
+    prepared = anyio.Event()
+    rename_done = anyio.Event()
+
+    class ConsistentFileResponse(FileResponse):
+        async def prepare(self) -> FileResponse:
+            response = await super().prepare()
+            prepared.set()
+            await rename_done.wait()
+            return response
+
+    response = ConsistentFileResponse(path, consistent_file_view=True)
+    messages: list[Message] = []
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    async def replace_file() -> None:
+        await prepared.wait()
+        _replace_file(path, new_content)
+        rename_done.set()
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(replace_file)
+        await response(
+            {"type": "http", "method": "get", "headers": []},
+            receive,
+            send,
+        )
+
+    body = b"".join(message["body"] for message in messages if message["type"] == "http.response.body")
+    assert body == old_content
+    assert messages[0]["headers"] == response.raw_headers
+
+
+@pytest.mark.parametrize(
+    ("method", "range_header"),
+    [
+        ("head", None),
+        ("get", b"bytes=0-3"),
+        ("get", b"bytes=0-3,8-11"),
+        ("head", b"bytes=0-3"),
+        ("head", b"bytes=0-3,8-11"),
+    ],
+)
+@pytest.mark.anyio
+async def test_file_response_consistent_file_view_headers_and_ranges(
+    tmp_path: Path, method: str, range_header: bytes | None
+) -> None:
+    path = tmp_path / "example.txt"
+    old_content = b"old version!"
+    new_content = b"new replacement version!"
+    path.write_bytes(old_content)
+    prepared = anyio.Event()
+    rename_done = anyio.Event()
+
+    class ConsistentFileResponse(FileResponse):
+        async def prepare(self) -> FileResponse:
+            response = await super().prepare()
+            prepared.set()
+            await rename_done.wait()
+            return response
+
+    response = ConsistentFileResponse(path, consistent_file_view=True)
+    messages: list[Message] = []
+    headers: list[tuple[bytes, bytes]] = []
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.start":
+            headers[:] = message["headers"]
+        else:
+            messages.append(message)
+
+    async def replace_file() -> None:
+        await prepared.wait()
+        _replace_file(path, new_content)
+        rename_done.set()
+
+    request_headers: list[tuple[bytes, bytes]] = []
+    if range_header is not None:
+        request_headers.append((b"range", range_header))
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(replace_file)
+        await response(
+            {"type": "http", "method": method, "headers": request_headers},
+            receive,
+            send,
+        )
+
+    response_headers = Headers(raw=headers)
+    body = b"".join(message["body"] for message in messages)
+    if range_header is None:
+        assert response_headers["content-length"] == str(len(old_content))
+        assert body == b""
+    elif range_header == b"bytes=0-3":
+        assert response_headers["content-range"] == f"bytes 0-3/{len(old_content)}"
+        assert body == (b"" if method == "head" else old_content[:4])
+    else:
+        assert response_headers["content-length"] != str(len(old_content))
+        if method == "get":
+            assert old_content[:4] in body
+            assert old_content[8:12] in body
+            assert new_content not in body
+
+
+@pytest.mark.anyio
+async def test_file_response_consistent_file_view_does_not_use_pathsend(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"content")
+    response = FileResponse(path, consistent_file_view=True)
+    message_types: list[str] = []
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        message_types.append(message["type"])
+
+    await response(
+        {"type": "http", "method": "get", "headers": [], "extensions": {"http.response.pathsend": {}}},
+        receive,
+        send,
+    )
+
+    assert "http.response.pathsend" not in message_types
+
+
+@pytest.mark.anyio
+async def test_consistent_file_response_empty_file(tmp_path: Path) -> None:
+    path = tmp_path / "empty.txt"
+    path.touch()
+    response = FileResponse(path, consistent_file_view=True)
+    messages: list[Message] = []
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    await response({"type": "http", "method": "get", "headers": []}, receive, send)
+
+    assert messages[0]["status"] == 200
+    assert Headers(raw=messages[0]["headers"])["content-length"] == "0"
+    assert messages[1]["body"] == b""
+
+
+@pytest.mark.anyio
+async def test_consistent_file_response_missing_before_headers_raises_runtime_error(tmp_path: Path) -> None:
+    response = FileResponse(tmp_path / "missing", consistent_file_view=True)
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:  # pragma: no cover
+        raise AssertionError("No response should be sent")
+
+    with pytest.raises(RuntimeError, match="does not exist"):
+        await response({"type": "http", "method": "get", "headers": []}, receive, send)
+
+
+@pytest.mark.anyio
+async def test_consistent_file_response_read_error_after_headers_disconnects(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"old version")
+    response = FileResponse(path, consistent_file_view=True)
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message["body"]:
+            raise OSError()
+
+    original_read = anyio.AsyncFile.read
+
+    async def failing_read(self: Any, *args: Any, **kwargs: Any) -> Any:
+        raise OSError()
+
+    anyio.AsyncFile.read = failing_read  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ClientDisconnect):
+            await response({"type": "http", "method": "get", "headers": []}, receive, send)
+    finally:
+        anyio.AsyncFile.read = original_read  # type: ignore[method-assign]
+
+    assert response._consistent_file is None
 
 
 def test_set_cookie(test_client_factory: TestClientFactory, monkeypatch: pytest.MonkeyPatch) -> None:

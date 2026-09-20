@@ -25,7 +25,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import iterate_in_threadpool
 from starlette.datastructures import URL, Headers, MutableHeaders
 from starlette.requests import ClientDisconnect
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 
 
 class Response:
@@ -308,10 +308,13 @@ class FileResponse(Response):
         stat_result: os.stat_result | None = None,
         method: str | None = None,
         content_disposition_type: str = "attachment",
+        consistent_file_view: bool = False,
     ) -> None:
         self.path = path
         self.status_code = status_code
         self.filename = filename
+        self.consistent_file_view = consistent_file_view
+        self._consistent_file: anyio.AsyncFile[bytes] | None = None
         if method is not None:
             warnings.warn(
                 "The 'method' parameter is not used, and it will be removed.",
@@ -330,9 +333,43 @@ class FileResponse(Response):
             else:
                 content_disposition = f'{content_disposition_type}; filename="{self.filename}"'
             self.headers.setdefault("content-disposition", content_disposition)
-        self.stat_result = stat_result
-        if stat_result is not None:
+        self.stat_result = None if consistent_file_view else stat_result
+        if stat_result is not None and not consistent_file_view:
             self.set_stat_headers(stat_result)
+
+    async def prepare(self) -> FileResponse:
+        """Open and stat the file when using a consistent file view."""
+        if not self.consistent_file_view or self._consistent_file is not None:
+            return self
+
+        try:
+            file = await anyio.open_file(self.path, mode="rb")
+        except FileNotFoundError:
+            raise RuntimeError(f"File at path {self.path} does not exist.")
+        except IsADirectoryError:
+            raise RuntimeError(f"File at path {self.path} is not a file.")
+
+        self._consistent_file = file
+        try:
+            stat_result = await anyio.to_thread.run_sync(os.fstat, file.wrapped.fileno())
+            if not stat.S_ISREG(stat_result.st_mode):
+                raise RuntimeError(f"File at path {self.path} is not a file.")
+            self.stat_result = stat_result
+            self.set_stat_headers(stat_result)
+        except BaseException:
+            self._consistent_file = None
+            with anyio.CancelScope(shield=True):
+                await file.aclose()
+            raise
+
+        return self
+
+    async def aclose(self) -> None:
+        file = self._consistent_file
+        if file is not None:
+            self._consistent_file = None
+            with anyio.CancelScope(shield=True):
+                await file.aclose()
 
     def set_stat_headers(self, stat_result: os.stat_result) -> None:
         content_length = str(stat_result.st_size)
@@ -348,7 +385,14 @@ class FileResponse(Response):
         send_header_only: bool = scope["method"].upper() == "HEAD"
         send_pathsend: bool = "http.response.pathsend" in scope.get("extensions", {})
 
-        if self.stat_result is None:
+        consistent_file = self._consistent_file
+        if self.consistent_file_view:
+            await self.prepare()
+            consistent_file = self._consistent_file
+            assert consistent_file is not None
+            assert self.stat_result is not None
+            stat_result = self.stat_result
+        elif self.stat_result is None:
             try:
                 stat_result = await anyio.to_thread.run_sync(os.stat, self.path)
                 self.set_stat_headers(stat_result)
@@ -365,42 +409,84 @@ class FileResponse(Response):
         http_range = headers.get("range")
         http_if_range = headers.get("if-range")
 
+        response_started = False
+
+        async def send_response(message: Message) -> None:
+            nonlocal response_started
+            await send(message)
+            if message["type"] == "http.response.start":
+                response_started = True
+
         if http_range is None or (http_if_range is not None and not self._should_use_range(http_if_range)):
-            await self._handle_simple(send, send_header_only, send_pathsend)
+            handler = self._handle_simple(send_response, send_header_only, send_pathsend, consistent_file)
         else:
             try:
                 ranges = self._parse_range_header(http_range, stat_result.st_size)
             except MalformedRangeHeader as exc:
-                return await PlainTextResponse(exc.content, status_code=400)(scope, receive, send)
+                response = PlainTextResponse(exc.content, status_code=400)
+                handler = response(scope, receive, send_response)
             except RangeNotSatisfiable as exc:
                 response = PlainTextResponse(status_code=416, headers={"Content-Range": f"*/{exc.max_size}"})
-                return await response(scope, receive, send)
-
-            if len(ranges) == 1:
-                start, end = ranges[0]
-                await self._handle_single_range(send, start, end, stat_result.st_size, send_header_only)
+                handler = response(scope, receive, send_response)
             else:
-                await self._handle_multiple_ranges(send, ranges, stat_result.st_size, send_header_only)
+                if len(ranges) == 1:
+                    start, end = ranges[0]
+                    handler = self._handle_single_range(
+                        send_response, start, end, stat_result.st_size, send_header_only, consistent_file
+                    )
+                else:
+                    handler = self._handle_multiple_ranges(
+                        send_response, ranges, stat_result.st_size, send_header_only, consistent_file
+                    )
+
+        if not self.consistent_file_view:
+            await handler
+        else:
+            try:
+                await handler
+            except OSError:
+                if response_started:
+                    raise ClientDisconnect()
+                raise
+            finally:
+                await self.aclose()
 
         if self.background is not None:
             await self.background()
 
-    async def _handle_simple(self, send: Send, send_header_only: bool, send_pathsend: bool) -> None:
+    async def _handle_simple(
+        self,
+        send: Send,
+        send_header_only: bool,
+        send_pathsend: bool,
+        file: anyio.AsyncFile[bytes] | None,
+    ) -> None:
         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
         if send_header_only:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
-        elif send_pathsend:
+        elif send_pathsend and file is None:
             await send({"type": "http.response.pathsend", "path": str(self.path)})
         else:
-            async with await anyio.open_file(self.path, mode="rb") as file:
+            if file is None:
+                file = await anyio.open_file(self.path, mode="rb")
+            try:
                 more_body = True
                 while more_body:
                     chunk = await file.read(self.chunk_size)
                     more_body = len(chunk) == self.chunk_size
                     await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+            finally:
+                if self._consistent_file is None:
+                    await file.aclose()
 
     async def _handle_single_range(
-        self, send: Send, start: int, end: int, file_size: int, send_header_only: bool
+        self,
+        send: Send,
+        start: int,
+        end: int,
+        file_size: int,
+        send_header_only: bool,
+        file: anyio.AsyncFile[bytes] | None,
     ) -> None:
         self.headers["content-range"] = f"bytes {start}-{end - 1}/{file_size}"
         self.headers["content-length"] = str(end - start)
@@ -408,7 +494,9 @@ class FileResponse(Response):
         if send_header_only:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
-            async with await anyio.open_file(self.path, mode="rb") as file:
+            if file is None:
+                file = await anyio.open_file(self.path, mode="rb")
+            try:
                 await file.seek(start)
                 more_body = True
                 while more_body:
@@ -416,6 +504,9 @@ class FileResponse(Response):
                     start += len(chunk)
                     more_body = len(chunk) == self.chunk_size and start < end
                     await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+            finally:
+                if self._consistent_file is None:
+                    await file.aclose()
 
     async def _handle_multiple_ranges(
         self,
@@ -423,6 +514,7 @@ class FileResponse(Response):
         ranges: list[tuple[int, int]],
         file_size: int,
         send_header_only: bool,
+        file: anyio.AsyncFile[bytes] | None,
     ) -> None:
         # In firefox and chrome, they use boundary with 95-96 bits entropy (that's roughly 13 bytes).
         boundary = token_hex(13)
@@ -435,7 +527,9 @@ class FileResponse(Response):
         if send_header_only:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
-            async with await anyio.open_file(self.path, mode="rb") as file:
+            if file is None:
+                file = await anyio.open_file(self.path, mode="rb")
+            try:
                 for start, end in ranges:
                     await send({"type": "http.response.body", "body": header_generator(start, end), "more_body": True})
                     await file.seek(start)
@@ -451,6 +545,9 @@ class FileResponse(Response):
                         "more_body": False,
                     }
                 )
+            finally:
+                if self._consistent_file is None:
+                    await file.aclose()
 
     def _should_use_range(self, http_if_range: str) -> bool:
         return http_if_range == self.headers["last-modified"] or http_if_range == self.headers["etag"]

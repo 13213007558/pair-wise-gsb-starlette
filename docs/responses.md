@@ -171,8 +171,25 @@ Takes a different set of arguments to instantiate than the other response types:
 * `media_type` - A string giving the media type. If unset, the filename or path will be used to infer a media type.
 * `filename` - If set, this will be included in the response `Content-Disposition`.
 * `content_disposition_type` - will be included in the response `Content-Disposition`. Can be set to "attachment" (default) or "inline".
+* `consistent_file_view` - Open the file and `fstat()` its descriptor before sending headers. Defaults to `False`.
 
 File responses will include appropriate `Content-Length`, `Last-Modified` and `ETag` headers.
+
+By default, the response stats the path and later opens the same path again. This permits the ASGI
+`http.response.pathsend` optimization, while regular GET responses stream in chunks from the second open.
+An atomic `rename()` replacement between those operations can make headers describe one file version and the
+body describe another; the default mode intentionally does not provide a cross-replacement version guarantee.
+
+Set `consistent_file_view=True` when serving files that may be replaced atomically. The response then derives
+`Content-Length`, validator headers, and all single or multipart Range boundaries from one open file object,
+and streams that same descriptor. The file is not copied or read into memory. Renaming, moving, or changing
+permissions after the descriptor is opened does not alter an in-progress response on platforms where open file
+descriptors keep the original file. In-place writes, truncation, and filesystem-specific guarantees are outside
+this version boundary. `pathsend` is not used in this mode because it hands only a path to the server.
+
+If opening or statting fails before the response starts, `FileResponse` raises the same file errors as the
+default mode. Once response headers have been sent, an operating-system error while reading the already opened
+version is reported as a client disconnect; HTTP status or headers cannot be changed at that point.
 
 ```python
 from starlette.responses import FileResponse

@@ -13,9 +13,10 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import FileResponse, Response
 from starlette.routing import Mount
 from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 from tests.types import TestClientFactory
 
 
@@ -601,3 +602,132 @@ def test_staticfiles_relative_directory_symlinks(test_client_factory: TestClient
     response = client.get("/example.txt")
     assert response.status_code == 200
     assert response.text == "123\n"
+
+
+def test_staticfiles_consistent_file_view_remains_stable_across_rename(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    path = tmp_path / "example.txt"
+    old_content = b"old static content"
+    new_content = b"new static replacement content"
+    path.write_bytes(old_content)
+
+    class ConsistentStaticFiles(StaticFiles):
+        async def _prepare_file_response(
+            self, response: FileResponse, scope: Scope, check_not_modified: bool = True
+        ) -> Response:
+            original_prepare = response.prepare
+
+            async def prepared_response() -> Response:
+                result = await original_prepare()
+                replacement = tmp_path / "example.txt.replacement"
+                replacement.write_bytes(new_content)
+                os.replace(replacement, path)
+                return result
+
+            response.prepare = prepared_response  # type: ignore[method-assign,assignment]
+            return await super()._prepare_file_response(response, scope)
+
+    app = ConsistentStaticFiles(directory=tmp_path, consistent_file_view=True)
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt")
+    assert response.status_code == 200
+    assert response.content == old_content
+    assert response.headers["content-length"] == str(len(old_content))
+
+
+def test_staticfiles_consistent_file_view_head_empty_file(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "empty.txt").touch()
+    app = StaticFiles(directory=tmp_path, consistent_file_view=True)
+    client = test_client_factory(app)
+
+    response = client.head("/empty.txt")
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["content-length"] == "0"
+
+
+def test_staticfiles_consistent_file_view_304_uses_opened_file(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"content")
+    app = StaticFiles(directory=tmp_path, consistent_file_view=True)
+    client = test_client_factory(app)
+
+    first_response = client.get("/example.txt")
+    etag = first_response.headers["etag"]
+    response = client.get("/example.txt", headers={"if-none-match": etag})
+    assert response.status_code == 304
+    assert response.headers["etag"] == etag
+
+
+def test_staticfiles_consistent_file_view_follows_allowed_symlink(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("linked")
+    directory = tmp_path / "static"
+    directory.mkdir()
+    (directory / "link.txt").symlink_to(source)
+
+    app = StaticFiles(directory=directory, follow_symlink=True, consistent_file_view=True)
+    client = test_client_factory(app)
+
+    response = client.get("/link.txt")
+    assert response.status_code == 200
+    assert response.text == "linked"
+
+
+def test_staticfiles_consistent_file_view_path_validation_still_applies(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    directory = tmp_path / "static"
+    directory.mkdir()
+    outside.write_text("outside")
+    (directory / "link.txt").symlink_to(outside)
+    app = StaticFiles(directory=directory, consistent_file_view=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(app.get_response, "link.txt", {"method": "GET"})
+
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_consistent_file_view_missing_file_returns_404(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    path = tmp_path / "example.txt"
+
+    class ConsistentStaticFiles(StaticFiles):
+        async def _prepare_file_response(
+            self, response: FileResponse, scope: Scope, check_not_modified: bool = True
+        ) -> Response:
+            path.unlink()
+            return await super()._prepare_file_response(response, scope)
+
+    path.write_bytes(b"content")
+    app = ConsistentStaticFiles(directory=tmp_path, consistent_file_view=True)
+    routes = [Mount("/", app=app)]
+    client = test_client_factory(Starlette(routes=routes))
+
+    response = client.get("/example.txt")
+    assert response.status_code == 404
+
+
+def test_staticfiles_consistent_file_view_permission_error_returns_401(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_bytes(b"content")
+
+    async def denied_prepare(self: Any) -> Any:
+        raise PermissionError
+
+    monkeypatch.setattr("starlette.staticfiles.FileResponse.prepare", denied_prepare)
+    routes = [Mount("/", app=StaticFiles(directory=tmp_path, consistent_file_view=True))]
+    client = test_client_factory(Starlette(routes=routes))
+
+    response = client.get("/example.txt")
+    assert response.status_code == 401
