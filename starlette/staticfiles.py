@@ -45,6 +45,7 @@ class StaticFiles:
         html: bool = False,
         check_dir: bool = True,
         follow_symlink: bool = False,
+        consistent_file_view: bool = False,
     ) -> None:
         self.directory = directory
         self.packages = packages
@@ -52,6 +53,7 @@ class StaticFiles:
         self.html = html
         self.config_checked = False
         self.follow_symlink = follow_symlink
+        self.consistent_file_view = consistent_file_view
         if check_dir and directory is not None and not os.path.isdir(directory):
             raise RuntimeError(f"Directory '{directory}' does not exist")
 
@@ -77,9 +79,9 @@ class StaticFiles:
             assert spec is not None, f"Package {package!r} could not be found."
             assert spec.origin is not None, f"Package {package!r} could not be found."
             package_directory = os.path.normpath(os.path.join(spec.origin, "..", statics_dir))
-            assert os.path.isdir(package_directory), (
-                f"Directory '{statics_dir!r}' in package {package!r} could not be found."
-            )
+            assert os.path.isdir(
+                package_directory
+            ), f"Directory '{statics_dir!r}' in package {package!r} could not be found."
             directories.append(package_directory)
 
         return directories
@@ -126,7 +128,7 @@ class StaticFiles:
 
         if stat_result and stat.S_ISREG(stat_result.st_mode):
             # We have a static file to serve.
-            return self.file_response(full_path, stat_result, scope)
+            return await self.file_response(full_path, stat_result, scope)
 
         elif stat_result and stat.S_ISDIR(stat_result.st_mode) and self.html:
             # We're in HTML mode, and have got a directory URL.
@@ -139,13 +141,25 @@ class StaticFiles:
                     url = URL(scope=scope)
                     url = url.replace(path=url.path + "/")
                     return RedirectResponse(url=url)
-                return self.file_response(full_path, stat_result, scope)
+                return await self.file_response(full_path, stat_result, scope)
 
         if self.html:
             # Check for '404.html' if we're in HTML mode.
             full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, "404.html")
             if stat_result and stat.S_ISREG(stat_result.st_mode):
-                return FileResponse(full_path, stat_result=stat_result, status_code=404)
+                response = FileResponse(
+                    full_path,
+                    stat_result=stat_result,
+                    status_code=404,
+                    consistent_file_view=self.consistent_file_view,
+                )
+                if self.consistent_file_view:
+                    try:
+                        await response.prepare_consistent_file_view()
+                    except OSError as exc:
+                        await response.close_consistent_file_view()
+                        self._raise_file_error(exc)
+                return response
         raise HTTPException(status_code=404)
 
     def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
@@ -166,7 +180,7 @@ class StaticFiles:
                 continue
         return "", None
 
-    def file_response(
+    async def file_response(
         self,
         full_path: PathLike,
         stat_result: os.stat_result,
@@ -175,10 +189,32 @@ class StaticFiles:
     ) -> Response:
         request_headers = Headers(scope=scope)
 
-        response = FileResponse(full_path, status_code=status_code, stat_result=stat_result)
+        response = FileResponse(
+            full_path,
+            status_code=status_code,
+            stat_result=stat_result,
+            consistent_file_view=self.consistent_file_view,
+        )
+        try:
+            if self.consistent_file_view:
+                await response.prepare_consistent_file_view()
+        except OSError as exc:
+            await response.close_consistent_file_view()
+            self._raise_file_error(exc)
+
         if self.is_not_modified(response.headers, request_headers):
+            await response.close_consistent_file_view()
             return NotModifiedResponse(response.headers)
         return response
+
+    def _raise_file_error(self, exc: OSError) -> None:
+        if isinstance(exc, PermissionError):
+            raise HTTPException(status_code=401)
+        if isinstance(exc, FileNotFoundError):
+            raise HTTPException(status_code=404)
+        if exc.errno == errno.ENAMETOOLONG:
+            raise HTTPException(status_code=404)
+        raise
 
     async def check_config(self) -> None:
         """

@@ -171,8 +171,24 @@ Takes a different set of arguments to instantiate than the other response types:
 * `media_type` - A string giving the media type. If unset, the filename or path will be used to infer a media type.
 * `filename` - If set, this will be included in the response `Content-Disposition`.
 * `content_disposition_type` - will be included in the response `Content-Disposition`. Can be set to "attachment" (default) or "inline".
+* `consistent_file_view` - When `True`, open the file once and derive the validator headers, length, and range data from that open file object with `fstat`.
 
 File responses will include appropriate `Content-Length`, `Last-Modified` and `ETag` headers.
+
+By default, file metadata is read from the path and the body is subsequently opened from the same path. This preserves
+the existing behavior and permits the ASGI `http.response.pathsend` server optimization, but an atomic replacement can
+occur between those path operations.
+
+Set `consistent_file_view=True` when responses must not cross that replacement boundary. Starlette then keeps one file
+handle for both the headers and body. GET, HEAD, single ranges, multiple ranges, and empty files all use that handle;
+the file is streamed in chunks and is not copied or read fully into memory. `http.response.pathsend` is not used because
+it hands the path back to the server and cannot guarantee that the same opened version will be sent.
+
+Before response headers are sent, replacement, removal, or access errors can still produce a normal error response.
+After headers have been sent, the status and headers cannot be changed; an I/O error aborts the response as a client
+disconnect while the handle is closed in a finalization block. This guarantees one version within a response, but it
+does not create a snapshot of bytes written in place without replacing the file. Filesystem permission and link
+semantics still apply to the open descriptor.
 
 ```python
 from starlette.responses import FileResponse

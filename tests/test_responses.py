@@ -355,6 +355,220 @@ def test_file_response_with_range_header(tmp_path: Path, test_client_factory: Te
 
 
 @pytest.mark.anyio
+async def test_file_response_consistent_file_view_uses_opened_version(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    old_content = b"old file content"
+    new_content = b"new file content with different size"
+    path.write_bytes(old_content)
+
+    messages: list[Message] = []
+    head_messages: list[Message] = []
+    response = FileResponse(path=path, consistent_file_view=True)
+    head_response = FileResponse(path=path, consistent_file_view=True)
+    old_stat_result = path.stat()
+    await response.prepare_consistent_file_view()
+    await head_response.prepare_consistent_file_view()
+    path.replace(tmp_path / "replaced.txt")
+    (tmp_path / "new.txt").write_bytes(new_content)
+    (tmp_path / "new.txt").replace(path)
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    async def head_send(message: Message) -> None:
+        head_messages.append(message)
+
+    await response({"type": "http", "method": "get", "headers": []}, receive, send)
+    await head_response({"type": "http", "method": "head", "headers": []}, receive, head_send)
+
+    assert messages[0]["status"] == 200
+    assert b"".join(message["body"] for message in messages[1:]) == old_content
+    headers = Headers(raw=messages[0]["headers"])
+    assert headers["content-length"] == str(len(old_content))
+    assert response.stat_result.st_ino == old_stat_result.st_ino
+    assert response.consistent_file is None
+    assert head_messages[0]["status"] == 200
+    head_headers = Headers(raw=head_messages[0]["headers"])
+    assert head_headers["content-length"] == str(len(old_content))
+    assert head_messages[1]["body"] == b""
+
+
+@pytest.mark.anyio
+async def test_file_response_consistent_file_view_ranges(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    old_content = b"abcdefghijklmnopqrstuvwxyz"
+    new_content = b"0123456789"
+    path.write_bytes(old_content)
+
+    opened_response = FileResponse(path=path, consistent_file_view=True)
+    multi_response = FileResponse(path=path, consistent_file_view=True)
+    await opened_response.prepare_consistent_file_view()
+    await multi_response.prepare_consistent_file_view()
+    path.replace(tmp_path / "replaced.txt")
+    (tmp_path / "new.txt").write_bytes(new_content)
+    (tmp_path / "new.txt").replace(path)
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    messages: list[Message] = []
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    await opened_response(
+        {"type": "http", "method": "get", "headers": [(b"range", b"bytes=2-5")]},
+        receive,
+        send,
+    )
+    assert messages[0]["status"] == 206
+    assert b"".join(message["body"] for message in messages[1:]) == old_content[2:6]
+    headers = Headers(raw=messages[0]["headers"])
+    assert headers["content-length"] == "4"
+    assert headers["content-range"] == f"bytes 2-5/{len(old_content)}"
+
+    messages = []
+
+    async def multi_send(message: Message) -> None:
+        messages.append(message)
+
+    await multi_response(
+        {"type": "http", "method": "get", "headers": [(b"range", b"bytes=0-3, 20-25")]},
+        receive,
+        multi_send,
+    )
+    body = b"".join(message["body"] for message in messages[1:])
+    assert old_content[0:4] in body
+    assert old_content[20:26] in body
+    assert f"/{len(old_content)}".encode() in body
+    assert f"/{len(new_content)}".encode() not in body
+
+
+def test_file_response_consistent_file_view_empty_file(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
+    path = tmp_path / "empty.txt"
+    path.touch()
+
+    app = FileResponse(path=path, consistent_file_view=True)
+    client = test_client_factory(app)
+
+    result = client.get("/")
+    assert result.status_code == 200
+    assert result.content == b""
+    assert result.headers["content-length"] == "0"
+
+    result = client.head("/")
+    assert result.status_code == 200
+    assert result.content == b""
+    assert result.headers["content-length"] == "0"
+
+
+def test_file_response_consistent_file_view_keeps_custom_validators(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"abcdefghij")
+    etag = '"custom-etag"'
+    app = FileResponse(
+        path=path,
+        headers={"etag": etag, "content-length": "999", "last-modified": "Mon, 01 Jan 2024 00:00:00 GMT"},
+        consistent_file_view=True,
+    )
+    client = test_client_factory(app)
+
+    response = client.get("/", headers={"range": "bytes=2-5", "if-range": etag})
+
+    assert response.status_code == 206
+    assert response.content == b"cdef"
+    assert response.headers["etag"] == etag
+    assert response.headers["content-length"] == "4"
+    assert response.headers["last-modified"] == "Mon, 01 Jan 2024 00:00:00 GMT"
+
+
+@pytest.mark.anyio
+async def test_file_response_consistent_file_view_disables_pathsend(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"example")
+    app = FileResponse(path=path, consistent_file_view=True)
+    message_types: list[str] = []
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        message_types.append(message["type"])
+
+    await app(
+        {"type": "http", "method": "get", "headers": [], "extensions": {"http.response.pathsend": {}}},
+        receive,
+        send,
+    )
+
+    assert "http.response.pathsend" not in message_types
+    assert "http.response.body" in message_types
+
+
+def test_file_response_consistent_file_view_replaces_stale_stat_result(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"old")
+    stat_result = path.stat()
+    path.replace(tmp_path / "old.txt")
+    (tmp_path / "new.txt").write_bytes(b"new content")
+    (tmp_path / "new.txt").replace(path)
+    response = FileResponse(path=path, stat_result=stat_result, consistent_file_view=True)
+
+    with pytest.raises(RuntimeError, match="does not exist"):
+        anyio.run(response, {"type": "http", "method": "get", "headers": []}, lambda: None, lambda message: None)
+
+
+@pytest.mark.anyio
+async def test_file_response_consistent_file_view_error_before_start(tmp_path: Path) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"example")
+    response = FileResponse(path=path, consistent_file_view=True)
+    await response.prepare_consistent_file_view()
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        raise OSError("headers unavailable")
+
+    with pytest.raises(OSError):
+        await response({"type": "http", "method": "get", "headers": []}, receive, send)
+    assert response.consistent_file is None
+
+
+@pytest.mark.anyio
+async def test_file_response_consistent_file_view_error_after_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"example")
+    response = FileResponse(path=path, consistent_file_view=True)
+    await response.prepare_consistent_file_view()
+    file = response.consistent_file
+    assert file is not None
+    monkeypatch.setattr(file, "read", lambda size: (_ for _ in ()).throw(OSError("broken")))
+
+    async def receive() -> Message:  # type: ignore[empty-body]
+        ...  # pragma: no cover
+
+    async def send(message: Message) -> None:
+        pass
+
+    with pytest.raises(ClientDisconnect):
+        await response(
+            {"type": "http", "method": "get", "headers": []},
+            receive,
+            send,
+        )
+    assert response.consistent_file is None
+
+
+@pytest.mark.anyio
 async def test_file_response_with_pathsend(tmpdir: Path) -> None:
     path = tmpdir / "xyz"
     content = b"<file content>" * 1000

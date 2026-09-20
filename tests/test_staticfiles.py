@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import FileResponse, Response
 from starlette.routing import Mount
 from starlette.staticfiles import StaticFiles
 from tests.types import TestClientFactory
@@ -601,3 +601,146 @@ def test_staticfiles_relative_directory_symlinks(test_client_factory: TestClient
     response = client.get("/example.txt")
     assert response.status_code == 200
     assert response.text == "123\n"
+
+
+def test_staticfiles_consistent_file_view_uses_opened_version(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    old_content = b"old static content"
+    new_content = b"new static content with another size"
+    path = tmp_path / "example.txt"
+    path.write_bytes(old_content)
+
+    class ConsistentStaticFiles(StaticFiles):
+        async def file_response(self, *args: Any, **kwargs: Any) -> Response:
+            response = await super().file_response(*args, **kwargs)
+            path.replace(tmp_path / "replaced.txt")
+            (tmp_path / "new.txt").write_bytes(new_content)
+            (tmp_path / "new.txt").replace(path)
+            return response
+
+    app = ConsistentStaticFiles(directory=tmp_path, consistent_file_view=True)
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt")
+    assert response.status_code == 200
+    assert response.content == old_content
+    assert response.headers["content-length"] == str(len(old_content))
+
+    response = client.head("/example.txt")
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["content-length"] == str(len(new_content))
+
+    response = client.get("/example.txt", headers={"range": "bytes=4-9"})
+    assert response.status_code == 206
+    assert response.content == new_content[4:10]
+
+
+def test_staticfiles_consistent_file_view_ranges_and_empty_file(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"abcdefghijklmnop")
+    (tmp_path / "empty.txt").touch()
+    app = StaticFiles(directory=tmp_path, consistent_file_view=True)
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt", headers={"range": "bytes=2-5"})
+    assert response.status_code == 206
+    assert response.content == b"cdef"
+    assert response.headers["content-range"] == "bytes 2-5/16"
+
+    response = client.head("/example.txt", headers={"range": "bytes=2-5"})
+    assert response.status_code == 206
+    assert response.content == b""
+    assert response.headers["content-length"] == "4"
+
+    response = client.get("/example.txt", headers={"range": "bytes=0-3, 10-15"})
+    assert response.status_code == 206
+    assert b"abcd" in response.content
+    assert b"klmnop" in response.content
+
+    response = client.get("/empty.txt")
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["content-length"] == "0"
+
+
+def test_staticfiles_consistent_file_view_replaced_before_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"old")
+    stat_result = path.stat()
+    app = StaticFiles(directory=tmp_path, consistent_file_view=True)
+    replaced = False
+    original_open_file = FileResponse._open_file
+
+    def replace_before_open(file_path: Any, expected_stat_result: Any) -> Any:
+        nonlocal replaced
+        if not replaced and os.fspath(file_path) == str(path):
+            replaced = True
+            path.replace(tmp_path / "old.txt")
+            (tmp_path / "new.txt").write_bytes(b"new content")
+            (tmp_path / "new.txt").replace(path)
+        return original_open_file(file_path, expected_stat_result)
+
+    monkeypatch.setattr(FileResponse, "_open_file", staticmethod(replace_before_open))
+    monkeypatch.setattr(app, "lookup_path", lambda requested_path: (str(path), stat_result))
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(app.get_response, "example.txt", {"method": "GET", "headers": []})
+
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_consistent_file_view_permission_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "example.txt"
+    path.write_bytes(b"example")
+    stat_result = path.stat()
+    app = StaticFiles(directory=tmp_path, consistent_file_view=True)
+
+    def deny_open(file_path: Any, expected_stat_result: Any) -> Any:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(FileResponse, "_open_file", staticmethod(deny_open))
+    monkeypatch.setattr(app, "lookup_path", lambda requested_path: (str(path), stat_result))
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(app.get_response, "example.txt", {"method": "GET", "headers": []})
+
+    assert exc_info.value.status_code == 401
+
+
+def test_staticfiles_consistent_file_view_follows_allowed_symlink(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    outside = tmp_path / "outside.txt"
+    inside = tmp_path / "static"
+    inside.mkdir()
+    outside.write_text("allowed")
+    (inside / "link.txt").symlink_to(outside)
+
+    app = StaticFiles(directory=inside, follow_symlink=True, consistent_file_view=True)
+    client = test_client_factory(app)
+
+    response = client.get("/link.txt")
+    assert response.status_code == 200
+    assert response.text == "allowed"
+
+
+def test_staticfiles_consistent_file_view_keeps_symlink_policy(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    static_dir = root / "static"
+    static_dir.mkdir(parents=True)
+    outside = root / "outside.txt"
+    outside.write_text("private")
+    (static_dir / "outside.txt").symlink_to(outside)
+
+    app = StaticFiles(directory=static_dir, consistent_file_view=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        anyio.run(app.get_response, "outside.txt", {"method": "GET"})
+
+    assert exc_info.value.status_code == 404
