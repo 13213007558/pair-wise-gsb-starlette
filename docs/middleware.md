@@ -237,6 +237,7 @@ The following arguments are supported:
 * `https_only` - Indicate that the `"Secure"` flag should be set (can be used with HTTPS only). Defaults to `False`. Set this to `True` in production to ensure the session cookie is only sent over HTTPS.
 * `domain` - Domain of the cookie used to share cookie between subdomains or cross-domains. The browser defaults the domain to the same host that set the cookie, excluding subdomains ([reference](https://developer.mozilla.org/en-US/docs/Web/HTTP/Cookies#domain_attribute)).
 * `partitioned` - Set the `Partitioned` flag when you write or clear the session cookie. Defaults to `False`. Set `https_only=True` when you enable it. For cross-site embeds, also set `same_site="none"`. This gives your embedded app a separate session for each top-level site ([reference](https://developer.mozilla.org/en-US/docs/Web/Privacy/Guides/Third-party_cookies/Partitioned_cookies)).
+* `revocation_store` - Optional server-side store used to revoke session identities. Defaults to `None`, which keeps the plain signed-cookie behavior. See "Session revocation" below.
 
 
 ```python
@@ -252,6 +253,47 @@ middleware = [
 
 app = Starlette(routes=routes, middleware=middleware)
 ```
+
+### Session revocation
+
+Signed cookies alone cannot be invalidated server-side: clearing a session only asks the browser to drop the cookie, and a slow in-flight response can re-deliver the old cookie after the user has logged out, reactivating the session. Configuring a `revocation_store` closes this gap.
+
+In revocation-aware mode the middleware embeds a random session id and a generation counter into the signed cookie, and tracks revoked identities in the store. Loading a cookie, calling `request.session.revoke()`, and writing the session cookie back at response time all follow the same contract: once an identity has been revoked it is never loaded and never written back. In particular, if a logout completes while another request using the same identity is still in flight, the late response expires the cookie instead of re-delivering a valid session, and a browser that kept the old cookie is rejected by the server. A subsequent login is issued a fresh, independent identity that is unaffected by the earlier revocation.
+
+Revocation checks fail closed. If the store raises while a cookie is being loaded or written back, the cookie is treated as revoked rather than trusted. Errors raised by `revoke()` itself are propagated, so a failed logout is visible to the application.
+
+The guarantee applies up to the point where `http.response.start` is sent. Once the response start has been delivered the headers are on the wire, and the middleware can neither rewrite the session cookie nor recall any response body already sent. Endpoints that stream the response start early and must not serve revoked sessions should check `request.session` before sending.
+
+Starlette includes a thread-safe in-memory store for single-process applications. Its revocations are lost on restart and are not shared between processes. Persistence, eviction, and multi-process deployments are expressed by implementing the `SessionRevocationStore` protocol (`is_revoked()` / `revoke()`) on top of external storage.
+
+```python
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.sessions import InMemoryRevocationStore, SessionMiddleware
+
+routes = ...
+
+middleware = [
+    Middleware(
+        SessionMiddleware,
+        secret_key=...,
+        https_only=True,
+        revocation_store=InMemoryRevocationStore(),
+    )
+]
+
+app = Starlette(routes=routes, middleware=middleware)
+```
+
+Logging a user out is then a single call, which clears the session data, records the identity as revoked, and expires the cookie:
+
+```python
+async def logout(request):
+    request.session.revoke()
+    ...
+```
+
+Without a configured `revocation_store`, `request.session.revoke()` behaves like `request.session.clear()`: it expires the browser cookie but cannot prevent a saved cookie from being presented again.
 
 ## HTTPSRedirectMiddleware
 

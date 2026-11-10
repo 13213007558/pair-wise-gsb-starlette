@@ -168,7 +168,7 @@ class HTTPConnection(Mapping[str, Any], Generic[StateT]):
         return None
 
     @property
-    def session(self) -> dict[str, Any]:
+    def session(self) -> Session:
         assert "session" in self.scope, "SessionMiddleware must be installed to access request.session"
         session: Session = self.scope["session"]
         # We keep the hasattr in case people actually use their own `SessionMiddleware` implementation.
