@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import enum
 import json
-from collections.abc import AsyncIterator, Iterable
-from typing import Any, cast
+from collections.abc import AsyncIterator, Callable, Iterable
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, cast
 
 from starlette.requests import HTTPConnection, StateT
 from starlette.responses import Response
 from starlette.types import Message, Receive, Scope, Send
+
+if TYPE_CHECKING:
+    from starlette.leases import AuthorizationLease
 
 
 class WebSocketState(enum.Enum):
@@ -29,12 +33,32 @@ class WebSocketDisconnected(RuntimeError):
     """
 
 
+class AuthorizationLeaseExpired(Exception):
+    """
+    Raised when a new send is attempted after the connection's authorization
+    lease has been invalidated.
+
+    Blocked receives surface the invalidation as :class:`WebSocketDisconnect`
+    so existing disconnect handling keeps working, while a send that never
+    started is rejected with this exception carrying the close code and reason
+    that were sent to the client.
+    """
+
+    def __init__(self, code: int = 1008, reason: str | None = None) -> None:
+        self.code = code
+        self.reason = reason or ""
+        super().__init__(f"Authorization lease invalidated: {code} {self.reason}".rstrip())
+
+
 class WebSocket(HTTPConnection[StateT]):
     def __init__(self, scope: Scope, receive: Receive, send: Send) -> None:
         super().__init__(scope)
         assert scope["type"] == "websocket"
         self._receive = receive
         self._send = send
+        # Installed by an authorization lease to reject new data frames once
+        # the lease has been invalidated, before the state machine runs.
+        self._lease_send_guard: Callable[[Message], None] | None = None
         self.client_state = WebSocketState.CONNECTING
         self.application_state = WebSocketState.CONNECTING
 
@@ -66,6 +90,8 @@ class WebSocket(HTTPConnection[StateT]):
         """
         Send ASGI websocket messages, ensuring valid state transitions.
         """
+        if self._lease_send_guard is not None:
+            self._lease_send_guard(message)
         if self.application_state == WebSocketState.CONNECTING:
             message_type = message["type"]
             if message_type not in {"websocket.accept", "websocket.close", "websocket.http.response.start"}:
@@ -191,6 +217,28 @@ class WebSocket(HTTPConnection[StateT]):
             await response(self.scope, self.receive, self.send)
         else:
             raise RuntimeError("The server doesn't support the Websocket Denial Response extension.")
+
+    @asynccontextmanager
+    async def lease(self, authorization_lease: AuthorizationLease) -> AsyncIterator[WebSocket[StateT]]:
+        """
+        Guard the connection with an authorization lease.
+
+        Enter the context before ``accept()`` and run the whole session inside
+        it. While the lease is valid the WebSocket behaves exactly as usual.
+        When the lease expires, a revocation event is received, or the
+        notification source fails under the fail-closed policy, the framework
+        sends exactly one close frame, stops delivering new client messages to
+        the application, rejects any new send, and cancels blocked waits so the
+        context unwinds.
+
+        Business work that has already started is not rolled back: cancelling a
+        blocked ``receive``/``send`` await releases the wait, while synchronous
+        work already running on the task runs to completion.
+        """
+        from starlette.leases import _LeaseGuard
+
+        async with _LeaseGuard(self, authorization_lease).activate():
+            yield self
 
 
 class WebSocketClose:
