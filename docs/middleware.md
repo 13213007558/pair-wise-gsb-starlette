@@ -300,13 +300,22 @@ domains such as `*.example.com` are supported for matching subdomains. Use brack
 notation for IPv6 addresses, such as `allowed_hosts=["[::1]"]`. To allow any hostname,
 use `allowed_hosts=["*"]` or omit the middleware.
 * `www_redirect` - If set to True, requests to non-www versions of the allowed hosts will be redirected to their www counterparts. Defaults to `True`.
+* `strict` - If set to True, the raw ASGI headers are validated before any host matching
+takes place. Requests with a missing or duplicated `Host` header, control characters, an
+invalid port, or an ambiguous IPv6 literal are rejected outright, and `allowed_hosts`
+entries may include a port constraint such as `example.com:8080`. An omitted port is
+treated as equivalent to the default port for the request scheme (`80` for `http`/`ws`,
+`443` for `https`/`wss`), and the `www` redirect is built from the validated authority
+rather than the raw request headers. Defaults to `False`.
 
 If an incoming request does not validate correctly then a 400 response will be sent.
 
 Use this middleware whenever you build absolute URLs with `request.url_for()`, and list your
 domains in `allowed_hosts`. Those URLs use the `Host` header, which the client controls, and
 the default `allowed_hosts` accepts every host. See
-[Absolute URLs behind a proxy](routing.md#absolute-urls-behind-a-proxy).
+[Absolute URLs behind a proxy](routing.md#absolute-urls-behind-a-proxy). Enable `strict`
+mode to guarantee that the host which passes validation is exactly the host later used for
+URL generation, for example when building login redirect URLs.
 
 ## RequestBodyLimitMiddleware
 
