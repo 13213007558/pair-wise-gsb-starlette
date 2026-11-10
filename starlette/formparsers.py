@@ -279,9 +279,20 @@ class MultiPartParser:
                 self._file_parts_to_finish.clear()
             parser.finalize()
         except BaseException as exc:
-            # Close all the files if parsing or reading the request stream fails.
+            # Close all the files if parsing or reading the request stream
+            # fails.  A failure to close one file must not prevent the
+            # remaining files from being released, and it must not replace the
+            # error that triggered the cleanup, so close failures are recorded
+            # as notes on the original exception.
             for file in self._files_to_close_on_error:
-                file.close()
+                try:
+                    file.close()
+                except BaseException as close_exc:
+                    if close_exc is not exc:
+                        exc.add_note(
+                            "Another exception occurred while closing an uploaded file: "
+                            f"{type(close_exc).__name__}: {close_exc}"
+                        )
             if isinstance(exc, FormParserError):
                 raise MultiPartException("Invalid multipart data.") from exc
             raise
