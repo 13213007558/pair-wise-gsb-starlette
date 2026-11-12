@@ -4,13 +4,14 @@ import errno
 import importlib.util
 import os
 import stat
+from collections.abc import Awaitable, Callable
 from email.utils import parsedate
 from typing import Union
 
 import anyio
 import anyio.to_thread
 
-from starlette._utils import get_route_path
+from starlette._utils import get_route_path, is_async_callable
 from starlette.datastructures import URL, Headers
 from starlette.exceptions import HTTPException
 from starlette.responses import FileResponse, RedirectResponse, Response
@@ -18,6 +19,13 @@ from starlette.types import Receive, Scope, Send
 from starlette.websockets import WebSocketClose
 
 PathLike = Union[str, "os.PathLike[str]"]
+
+# An admission callback decides whether a request is allowed to reach a
+# specific static resource. It receives the ASGI scope (request context), the
+# identifier of the export root that owns the resource, and the normalized
+# relative resource path within that root, using ``/`` separators. A falsy
+# return value denies the request; truthy values allow it.
+AdmissionCallback = Callable[[Scope, str, str], bool | Awaitable[bool]]
 
 
 class NotModifiedResponse(Response):
@@ -46,6 +54,7 @@ class StaticFiles:
         html: bool = False,
         check_dir: bool = True,
         follow_symlink: bool = False,
+        admission: AdmissionCallback | None = None,
     ) -> None:
         self.directory = directory
         self.packages = packages
@@ -53,6 +62,7 @@ class StaticFiles:
         self.html = html
         self.config_checked = False
         self.follow_symlink = follow_symlink
+        self.admission = admission
         if check_dir and directory is not None and not os.path.isdir(directory):
             raise RuntimeError(f"Directory '{directory}' does not exist")
 
@@ -120,7 +130,7 @@ class StaticFiles:
             raise HTTPException(status_code=405, headers={"Allow": "GET, HEAD"})
 
         try:
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, path)
+            full_path, stat_result, root = await anyio.to_thread.run_sync(self.lookup_path, path)
         except PermissionError:
             raise HTTPException(status_code=401)
         except OSError as exc:
@@ -135,14 +145,16 @@ class StaticFiles:
 
         if stat_result and stat.S_ISREG(stat_result.st_mode):
             # We have a static file to serve.
+            await self._admit(scope, root, path)
             return self.file_response(full_path, stat_result, scope)
 
         elif stat_result and stat.S_ISDIR(stat_result.st_mode) and self.html:
             # We're in HTML mode, and have got a directory URL.
             # Check if we have 'index.html' file to serve.
             index_path = os.path.join(path, "index.html")
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, index_path)
+            full_path, stat_result, root = await anyio.to_thread.run_sync(self.lookup_path, index_path)
             if stat_result is not None and stat.S_ISREG(stat_result.st_mode):
+                await self._admit(scope, root, index_path)
                 if not scope["path"].endswith("/"):
                     # Directory URLs should redirect to always end in "/".
                     url = URL(scope=scope)
@@ -152,15 +164,41 @@ class StaticFiles:
 
         if self.html:
             # Check for '404.html' if we're in HTML mode.
-            full_path, stat_result = await anyio.to_thread.run_sync(self.lookup_path, "404.html")
+            full_path, stat_result, root = await anyio.to_thread.run_sync(self.lookup_path, "404.html")
             if stat_result and stat.S_ISREG(stat_result.st_mode):
+                await self._admit(scope, root, "404.html")
                 return FileResponse(full_path, stat_result=stat_result, status_code=404)
         raise HTTPException(status_code=404)
 
-    def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
+    async def _admit(self, scope: Scope, root: str, resource_path: str) -> None:
+        """
+        Run the configured admission callback before any response that would
+        expose a resource. A denial always surfaces as a plain 404, identical to
+        the response for a missing resource, so it cannot reveal whether the
+        file exists. Callback errors fail closed as 500 instead of falling back
+        to public serving. When no callback is configured, serving stays public.
+        """
+        if self.admission is None:
+            return
+
+        relative_path = resource_path.replace(os.sep, "/")
+        try:
+            if is_async_callable(self.admission):
+                allowed = await self.admission(scope, root, relative_path)
+            else:
+                allowed = await anyio.to_thread.run_sync(self.admission, scope, root, relative_path)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500) from exc
+
+        if not allowed:
+            raise HTTPException(status_code=404)
+
+    def lookup_path(self, path: str) -> tuple[str, os.stat_result | None, str]:
         # Reject absolute paths so they cannot escape the served directory.
         if path.startswith(("/", "\\")):
-            return "", None
+            return "", None, ""
         for directory in self.all_directories:
             joined_path = os.path.join(directory, path)
             if self.follow_symlink:
@@ -173,10 +211,10 @@ class StaticFiles:
                 # Don't allow misbehaving clients to break out of the static files directory.
                 continue
             try:
-                return full_path, os.stat(full_path)
+                return full_path, os.stat(full_path), str(directory)
             except (FileNotFoundError, NotADirectoryError):
                 continue
-        return "", None
+        return "", None, ""
 
     def file_response(
         self,

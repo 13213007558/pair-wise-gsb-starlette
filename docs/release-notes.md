@@ -2,6 +2,12 @@
 toc_depth: 2
 ---
 
+## Unreleased
+
+#### Added
+
+* Add an optional `admission` callback to `StaticFiles` for per-resource authorization before files are served. Denials return a generic `404` and callback errors fail closed with `500`; omitting the callback preserves public static serving.
+
 ## 1.10.0 (October 24, 2026)
 
 #### Changed

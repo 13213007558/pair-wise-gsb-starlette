@@ -1,3 +1,4 @@
+import io
 import os
 import stat
 import tempfile
@@ -642,9 +643,10 @@ def test_staticfiles_rejects_absolute_paths(tmp_path: Path) -> None:
     statics_path.mkdir()
     app = StaticFiles(directory=statics_path)
 
-    full_path, stat_result = app.lookup_path("/etc/passwd")
+    full_path, stat_result, root = app.lookup_path("/etc/passwd")
     assert full_path == ""
     assert stat_result is None
+    assert root == ""
 
 
 def test_staticfiles_rejects_absolute_windows_paths(tmp_path: Path) -> None:
@@ -652,9 +654,10 @@ def test_staticfiles_rejects_absolute_windows_paths(tmp_path: Path) -> None:
     statics_path.mkdir()
     app = StaticFiles(directory=statics_path)
 
-    full_path, stat_result = app.lookup_path("\\\\server\\share")
+    full_path, stat_result, root = app.lookup_path("\\\\server\\share")
     assert full_path == ""
     assert stat_result is None
+    assert root == ""
 
 
 def test_staticfiles_self_symlinks(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
@@ -682,3 +685,395 @@ def test_staticfiles_relative_directory_symlinks(test_client_factory: TestClient
     response = client.get("/example.txt")
     assert response.status_code == 200
     assert response.text == "123\n"
+
+
+def test_staticfiles_without_admission_keeps_public_default(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+
+    app = StaticFiles(directory=tmp_path)
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt")
+    assert response.status_code == 200
+    assert response.text == "<file content>"
+
+
+def test_staticfiles_admission_allows_and_logs_arguments(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+    calls: list[tuple[str, str]] = []
+
+    def admit(scope: dict, root: str, resource_path: str) -> bool:
+        # Identity must come from server-side state placed in the scope, never
+        # from self-reported client headers.
+        assert scope["user"] == "trusted"
+        calls.append((root, resource_path))
+        return True
+
+    async def authenticate(scope: dict, receive: Any, send: Any) -> None:
+        scope["user"] = "trusted"
+        await static_app(scope, receive, send)
+
+    static_app = StaticFiles(directory=tmp_path, admission=admit)
+    client = test_client_factory(authenticate)
+    response = client.get("/example.txt")
+
+    assert response.status_code == 200
+    assert response.text == "<file content>"
+    assert calls == [(os.path.realpath(os.fsdecode(tmp_path)), "example.txt")]
+
+
+def test_staticfiles_async_admission(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+
+    async def admit(scope: dict, root: str, resource_path: str) -> bool:
+        return resource_path == "example.txt"
+
+    app = StaticFiles(directory=tmp_path, admission=admit)
+    client = test_client_factory(app)
+
+    allowed = client.get("/example.txt")
+    assert allowed.status_code == 200
+    with pytest.raises(HTTPException) as exc_info:
+        client.get("/missing.txt")
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_admission_denial_is_indistinguishable_from_missing_file(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "secret.txt").write_text("top secret", encoding="utf-8")
+    (tmp_path / "public.txt").write_text("public", encoding="utf-8")
+
+    def admit(scope: dict, root: str, resource_path: str) -> bool:
+        return resource_path != "secret.txt"
+
+    app = StaticFiles(directory=tmp_path, admission=admit)
+    client = test_client_factory(app)
+
+    with pytest.raises(HTTPException) as denied_info:
+        client.get("/secret.txt")
+    with pytest.raises(HTTPException) as missing_info:
+        client.get("/does-not-exist.txt")
+
+    assert denied_info.value.status_code == missing_info.value.status_code == 404
+    assert denied_info.value.detail == missing_info.value.detail == "Not Found"
+    assert client.get("/public.txt").status_code == 200
+
+
+def test_staticfiles_admission_runs_for_head(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
+    (tmp_path / "secret.txt").write_text("top secret", encoding="utf-8")
+    calls: list[str] = []
+
+    def admit(scope: dict, root: str, resource_path: str) -> bool:
+        calls.append(resource_path)
+        return False
+
+    app = StaticFiles(directory=tmp_path, admission=admit)
+    client = test_client_factory(app)
+
+    with pytest.raises(HTTPException) as exc_info:
+        client.head("/secret.txt")
+    assert exc_info.value.status_code == 404
+    assert calls == ["secret.txt"]
+
+
+def test_staticfiles_admission_runs_before_304(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
+    (tmp_path / "secret.txt").write_text("top secret", encoding="utf-8")
+
+    def deny(scope: dict, root: str, resource_path: str) -> bool:
+        return False
+
+    app = StaticFiles(directory=tmp_path, admission=deny)
+    client = test_client_factory(app)
+
+    with pytest.raises(HTTPException) as exc_info:
+        client.get("/secret.txt", headers={"if-none-match": '"anything"'})
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "Not Found"
+
+
+def test_staticfiles_admission_allows_304_after_admission(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+
+    app = StaticFiles(directory=tmp_path, admission=lambda scope, root, path: True)
+    client = test_client_factory(app)
+
+    etag = client.get("/example.txt").headers["etag"]
+    response = client.get("/example.txt", headers={"if-none-match": etag})
+    assert response.status_code == 304
+
+
+def test_staticfiles_admission_runs_before_range_response(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "secret.txt").write_text("0123456789", encoding="utf-8")
+
+    app = StaticFiles(directory=tmp_path, admission=lambda scope, root, path: False)
+    client = test_client_factory(app)
+
+    with pytest.raises(HTTPException) as exc_info:
+        client.get("/secret.txt", headers={"range": "bytes=0-3"})
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "Not Found"
+
+
+def test_staticfiles_admission_denial_never_opens_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, test_client_factory: TestClientFactory
+) -> None:
+    secret_path = tmp_path / "secret.txt"
+    secret_path.write_text("top secret", encoding="utf-8")
+    opened: list[str] = []
+
+    real_open = io.open
+
+    def tracking_open(file, mode="r", *args: Any, **kwargs: Any) -> Any:
+        opened.append(os.fsdecode(file))
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("io.open", tracking_open)
+    monkeypatch.setattr("builtins.open", tracking_open)
+
+    app = StaticFiles(directory=tmp_path, admission=lambda scope, root, path: False)
+    client = test_client_factory(app)
+    with pytest.raises(HTTPException) as exc_info:
+        client.get("/secret.txt")
+
+    assert exc_info.value.status_code == 404
+    assert not any(os.path.abspath(path) == os.path.abspath(secret_path) for path in opened)
+
+
+def test_staticfiles_admission_denial_does_not_reuse_previous_allow(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+
+    def admit_once(scope: dict, root: str, resource_path: str) -> bool:
+        # Allow the first request for this resource, deny every subsequent one.
+        if getattr(admit_once, "used", False):
+            return False
+        admit_once.used = True  # type: ignore[attr-defined]
+        return True
+
+    app = StaticFiles(directory=tmp_path, admission=admit_once)
+    client = test_client_factory(app)
+
+    first = client.get("/example.txt")
+    assert first.status_code == 200
+    with pytest.raises(HTTPException) as exc_info:
+        client.get("/example.txt")
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_admission_covers_directory_index(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
+    (tmp_path / "404.html").write_text("<h1>Custom not found page</h1>", encoding="utf-8")
+    directory = tmp_path / "dir"
+    directory.mkdir()
+    (directory / "index.html").write_text("<h1>Hello</h1>", encoding="utf-8")
+    calls: list[str] = []
+
+    def admit(scope: dict, root: str, resource_path: str) -> bool:
+        calls.append(resource_path)
+        return not resource_path.startswith("dir")
+
+    app = StaticFiles(directory=tmp_path, html=True, admission=admit)
+    client = test_client_factory(app)
+
+    with pytest.raises(HTTPException) as slash_info:
+        client.get("/dir/")
+    assert slash_info.value.status_code == 404
+    with pytest.raises(HTTPException) as no_slash_info:
+        client.get("/dir")
+    assert no_slash_info.value.status_code == 404
+    # The directory redirect must not be issued before admission either.
+    assert all(call == "dir/index.html" for call in calls)
+
+
+def test_staticfiles_admission_allows_directory_index_and_redirect(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    directory = tmp_path / "dir"
+    directory.mkdir()
+    (directory / "index.html").write_text("<h1>Hello</h1>", encoding="utf-8")
+    calls: list[str] = []
+
+    app = StaticFiles(
+        directory=tmp_path,
+        html=True,
+        admission=lambda scope, root, path: calls.append(path) or True,
+    )
+    client = test_client_factory(app)
+
+    response = client.get("/dir")
+    assert response.status_code == 200
+    assert response.text == "<h1>Hello</h1>"
+    # The redirect is followed by the client, so admission runs once per hop,
+    # always against the concrete index resource.
+    assert calls == ["dir/index.html", "dir/index.html"]
+
+
+def test_staticfiles_admission_runs_before_directory_redirect(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    directory = tmp_path / "dir"
+    directory.mkdir()
+    (directory / "index.html").write_text("<h1>Hello</h1>", encoding="utf-8")
+
+    app = StaticFiles(directory=tmp_path, html=True, admission=lambda scope, root, path: False)
+    client = test_client_factory(app)
+
+    with pytest.raises(HTTPException) as exc_info:
+        client.get("/dir", follow_redirects=False)
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_admission_covers_custom_404(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
+    (tmp_path / "404.html").write_text("<h1>Custom not found page</h1>", encoding="utf-8")
+    calls: list[str] = []
+
+    def admit(scope: dict, root: str, resource_path: str) -> bool:
+        calls.append(resource_path)
+        return resource_path != "404.html"
+
+    app = StaticFiles(directory=tmp_path, html=True, admission=admit)
+    client = test_client_factory(app)
+
+    with pytest.raises(HTTPException) as exc_info:
+        client.get("/missing")
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "Not Found"
+    assert "404.html" in calls
+
+
+def test_staticfiles_admission_callback_exception_fails_closed(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+
+    def boom(scope: dict, root: str, resource_path: str) -> bool:
+        raise RuntimeError("authorization backend down")
+
+    app = StaticFiles(directory=tmp_path, admission=boom)
+    client = test_client_factory(app, raise_server_exceptions=False)
+
+    response = client.get("/example.txt")
+    assert response.status_code == 500
+    assert "<file content>" not in response.text
+
+
+def test_staticfiles_admission_async_exception_fails_closed(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+
+    async def boom(scope: dict, root: str, resource_path: str) -> bool:
+        raise RuntimeError("authorization backend down")
+
+    app = StaticFiles(directory=tmp_path, admission=boom)
+    client = test_client_factory(app, raise_server_exceptions=False)
+
+    response = client.get("/example.txt")
+    assert response.status_code == 500
+    assert "<file content>" not in response.text
+
+
+def test_staticfiles_admission_receives_normalized_relative_path(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "file.txt").write_text("x", encoding="utf-8")
+    seen: list[tuple[str, str]] = []
+
+    app = StaticFiles(
+        directory=tmp_path,
+        admission=lambda scope, root, path: seen.append((root, path)) or True,
+    )
+    client = test_client_factory(app)
+
+    response = client.get("/nested/./file.txt")
+    assert response.status_code == 200
+    assert seen == [(os.path.realpath(os.fsdecode(tmp_path)), os.path.join("nested", "file.txt").replace(os.sep, "/"))]
+
+
+def test_staticfiles_admission_respects_mount_prefix_and_root_path(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+    seen: list[str] = []
+
+    app = Starlette(
+        routes=[
+            Mount(
+                "/reports",
+                app=StaticFiles(
+                    directory=tmp_path,
+                    admission=lambda scope, root, path: seen.append(path) or True,
+                ),
+            )
+        ]
+    )
+    client = test_client_factory(app)
+
+    response = client.get("/reports/example.txt")
+    assert response.status_code == 200
+    assert seen == ["example.txt"]
+
+
+def test_staticfiles_admission_cannot_trust_client_headers(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "secret.txt").write_text("top secret", encoding="utf-8")
+
+    def admit(scope: dict, root: str, resource_path: str) -> bool:
+        # Deliberately ignore the spoofable header and rely on server state.
+        request = Request(scope)
+        assert request.headers.get("x-user") == "admin"
+        return scope.get("user") == "admin"
+
+    app = StaticFiles(directory=tmp_path, admission=admit)
+    client = test_client_factory(app)
+
+    with pytest.raises(HTTPException) as exc_info:
+        client.get("/secret.txt", headers={"x-user": "admin"})
+    assert exc_info.value.status_code == 404
+
+
+def test_staticfiles_admission_strips_external_root_path(
+    tmp_path: Path, test_client_factory: TestClientFactory
+) -> None:
+    (tmp_path / "example.txt").write_text("<file content>", encoding="utf-8")
+    seen: list[str] = []
+
+    app = StaticFiles(
+        directory=tmp_path,
+        admission=lambda scope, root, path: seen.append(path) or True,
+    )
+    client = test_client_factory(app, root_path="/gateway")
+
+    response = client.get("/example.txt")
+    assert response.status_code == 200
+    assert seen == ["example.txt"]
+
+
+def test_staticfiles_admission_reports_package_root(tmp_path: Path, test_client_factory: TestClientFactory) -> None:
+    # Only the package root contains the requested file, so the callback has to
+    # receive that root identifier rather than the empty directory.
+    seen: list[tuple[str, str]] = []
+
+    app = StaticFiles(
+        directory=tmp_path,
+        packages=["tests"],
+        admission=lambda scope, root, path: seen.append((root, path)) or True,
+    )
+    client = test_client_factory(app)
+
+    response = client.get("/example.txt")
+    assert response.status_code == 200
+    assert response.text == "123\n"
+    assert seen == [(os.path.realpath(os.path.join("tests", "statics")), "example.txt")]
